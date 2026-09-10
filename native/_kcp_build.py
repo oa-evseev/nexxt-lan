@@ -1,4 +1,4 @@
-"""Build definition for the vendored upstream KCP C implementation."""
+"""CFFI build definition for the pinned upstream KCP implementation."""
 
 from cffi import FFI
 
@@ -39,10 +39,10 @@ ffibuilder.cdef("""
     int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc);
     """)
 ffibuilder.set_source(
-    "tuya_p2p._kcp_native",
+    "_nexxt_lan_kcp_native",
     '#include "ikcp.h"',
-    include_dirs=["tuya_p2p/vendor/kcp"],
-    sources=["tuya_p2p/vendor/kcp/ikcp.c"],
+    include_dirs=["vendor/kcp"],
+    sources=["vendor/kcp/ikcp.c"],
 )
 
 

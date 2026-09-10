@@ -19,7 +19,7 @@ from ._kcp_common import (
 )
 
 try:
-    from ._kcp_native import ffi, lib
+    from _nexxt_lan_kcp_native import ffi, lib
 except ModuleNotFoundError as exc:  # pragma: no cover - packaging failure only
     raise ImportError(
         "the native KCP extension is not built; install the project before use"

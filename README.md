@@ -21,23 +21,20 @@ python3 -m venv .venv
 python -m pip install .
 ```
 
-For the preferred CFFI binding of upstream KCP, install the native extra in a
-build environment with a C compiler. Published native wheels use it
-automatically; when building from a checkout, install CFFI first, then build
-without an isolated build environment so the extension is included:
+For the preferred CFFI binding of upstream KCP, install the native extra. It
+pulls the separately published, platform-specific `nexxt-lan-native`
+distribution, which declares CFFI as its own isolated build dependency:
 
 ```sh
-python -m pip install 'setuptools>=68' 'cffi>=1.15'
-python -m pip install --no-build-isolation '.[native]'
+python -m pip install 'nexxt-lan[native]'
 ```
 
-Run the installed `nexxt-lan` command after this installation. Running
-`python nexxt_lan.py` directly from a checkout shadows the installed package
-with the source tree, which does not contain the wheel's compiled extension.
-For direct-from-checkout native development, build it in place first:
+When building both unpublished distributions from a checkout, build the
+native wheel first and offer it to pip as a local artifact:
 
 ```sh
-python setup.py build_ext --inplace
+python -m pip wheel --wheel-dir dist ./native
+python -m pip install --find-links dist '.[native]'
 ```
 
 Install optional TinyTuya discovery support with:

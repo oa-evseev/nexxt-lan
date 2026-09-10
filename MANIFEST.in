@@ -1,3 +1,4 @@
 include config.example.json
+include VERSION
 recursive-include docs *.md
-recursive-include tuya_p2p/vendor/kcp LICENSE REVISION *.c *.h
+recursive-include tuya_p2p/vendor/kcp LICENSE REVISION

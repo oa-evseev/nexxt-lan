@@ -1,18 +1,29 @@
-"""Setuptools hook that builds native KCP only when CFFI is available.
+"""Setuptools metadata derived from the repository's single VERSION file."""
 
-The normal package remains installable as pure Python. A build environment
-that has CFFI compiles the vendored upstream implementation; otherwise the
-resulting wheel uses the Python fallback only.
-"""
+from pathlib import Path
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 
-try:
-    import cffi  # noqa: F401
-except ImportError:
-    cffi_modules = []
-else:
-    cffi_modules = ["tuya_p2p/_kcp_build.py:ffibuilder"]
+VERSION = (Path(__file__).parent / "VERSION").read_text(encoding="utf-8").strip()
 
-setup(cffi_modules=cffi_modules)
+setup(
+    name="nexxt-lan",
+    version=VERSION,
+    description="Local LAN client for supported Nexxt/Tuya camera RTC paths",
+    long_description=(Path(__file__).parent / "README.md").read_text(encoding="utf-8"),
+    long_description_content_type="text/markdown",
+    license="MIT",
+    python_requires=">=3.10",
+    install_requires=["cryptography>=41"],
+    extras_require={
+        "discovery": ["tinytuya>=1.20"],
+        "native": [f"nexxt-lan-native=={VERSION}"],
+        "test": ["pytest>=8"],
+        "dev": ["pytest>=8", "black>=24"],
+    },
+    py_modules=["nexxt_lan"],
+    packages=find_packages(include=["nexxt*", "tuya_p2p*"]),
+    package_data={"tuya_p2p": ["vendor/kcp/LICENSE", "vendor/kcp/REVISION"]},
+    entry_points={"console_scripts": ["nexxt-lan=nexxt_lan:main"]},
+)

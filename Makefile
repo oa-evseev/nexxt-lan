@@ -16,8 +16,7 @@ help:
 $(PYTHON):
 	python3 -m venv $(VENV)
 
-$(ENV_STAMP): pyproject.toml setup.py tuya_p2p/_kcp_build.py \
-		tuya_p2p/vendor/kcp/ikcp.c tuya_p2p/vendor/kcp/ikcp.h $(PYTHON)
+$(ENV_STAMP): pyproject.toml setup.py $(PYTHON)
 	$(PIP) install --upgrade pip
 	$(PIP) install -e '.[dev,discovery]'
 	touch $@
@@ -37,7 +36,7 @@ format: env
 	$(PYTHON) -m black --workers 1 nexxt_lan.py nexxt tuya_p2p tests
 
 clean:
-	rm -rf build dist *.egg-info .pytest_cache
+	rm -rf build native/build dist *.egg-info native/*.egg-info .pytest_cache
 	find . -type d -name '__pycache__' -prune -exec rm -rf {} +
 	find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '*.so' -o -name '*.pyd' \) -delete
 

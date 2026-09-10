@@ -18,9 +18,15 @@ Run the full production suite:
 python -m pytest -q
 ```
 
-The KCP behavior suite selects both installed implementations. The `dev` extra
-includes CFFI, so an editable install with a compiler builds the native
-extension; a `test`-only or base environment exercises the Python fallback.
+The KCP behavior suite selects both installed implementations. A `test`-only
+or base environment exercises the Python fallback. To test both from an
+unpublished checkout, build and install the native artifact with ordinary
+isolated builds:
+
+```sh
+python -m pip wheel --wheel-dir dist ./native
+python -m pip install --find-links dist '.[native]'
+```
 
 Run protocol/live-path coverage:
 

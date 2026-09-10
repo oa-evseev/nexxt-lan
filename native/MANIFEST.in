@@ -1,0 +1,2 @@
+include _kcp_build.py
+recursive-include vendor/kcp LICENSE REVISION *.c *.h
