@@ -1,0 +1,22 @@
+# Local configuration and credentials
+.env*
+config.json
+
+# Sensitive diagnostics
+*.bin
+*.messages
+*.encrypted
+*.h265
+*.s16le
+
+# Python/build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+*.egg-info/
+build/
+dist/

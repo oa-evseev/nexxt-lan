@@ -1,0 +1,3 @@
+include config.example.json
+recursive-include docs *.md
+recursive-include tuya_p2p/vendor/kcp LICENSE REVISION *.c *.h

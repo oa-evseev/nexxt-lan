@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "cffi>=1.15"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexxt-lan"
+version = "0.1.0"
+description = "Local LAN client for supported Nexxt/Tuya camera RTC paths"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "cffi>=1.15",
+    "cryptography>=41",
+]
+
+[project.optional-dependencies]
+discovery = ["tinytuya>=1.20"]
+test = ["pytest>=8"]
+dev = ["pytest>=8", "black>=24"]
+
+[project.scripts]
+nexxt-lan = "nexxt_lan:main"
+
+[tool.setuptools]
+py-modules = ["nexxt_lan"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nexxt*", "tuya_p2p*"]
+
+[tool.setuptools.package-data]
+tuya_p2p = ["vendor/kcp/LICENSE", "vendor/kcp/REVISION", "vendor/kcp/*.c", "vendor/kcp/*.h"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]

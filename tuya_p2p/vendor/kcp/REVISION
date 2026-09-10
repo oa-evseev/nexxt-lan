@@ -1,0 +1,19 @@
+Upstream repository: https://github.com/skywind3000/kcp
+Pinned commit: b1a7a2101dcbb96017681a500d6b82bbe5a88766
+Commit date: 2026-06-23
+Retrieved: 2026-09-10
+
+Vendored files:
+  ikcp.c
+    upstream SHA-256 (CRLF): 8654038a70d1bbe605aa94f066554ffb30bf28580a58769970221de3ba5027f0
+    vendored SHA-256 (LF):   b4b337bb6267fb361a50b0b4f56c2fc34e067e75e8dc61cf48a603dcb5a7824a
+  ikcp.h
+    upstream SHA-256 (CRLF): d67a0e67ba5701f1e882894b4415c4d3ad3d7d9f7231dd2ca68c6037c5217933
+    vendored SHA-256 (LF):   a8b1613daa4a452bf22d25af1cc3dd7e558937e212e7a70761a1ccf5ea6c6ef5
+  LICENSE
+    upstream SHA-256:        6587fd02a924b97dbd6758b0573ddec056fb494a84f3709c5aaa33ce1f7f029c
+    vendored SHA-256:        abcb12583b5ffa9ffbd1fd5bfeaeea4c3f7f7a81313f39b772e9525db2f0c26e
+
+The C and header contents are the official files at the pinned commit. Only
+their line endings were normalized from CRLF to LF. LICENSE has a final newline
+added for repository text-file consistency; its license text is unchanged.

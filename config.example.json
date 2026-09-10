@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "client": {
+    "uid_env": "NEXXT_EXAMPLE_CLIENT_ID",
+    "local_ip_env": "NEXXT_EXAMPLE_BIND_IP",
+    "stun_port_env": "NEXXT_EXAMPLE_STUN_PORT"
+  },
+  "cameras": [
+    {
+      "id": "synthetic-device-direct-001",
+      "name": "example-direct-camera",
+      "lan_protocol": "3.3",
+      "rtc_mode": "direct",
+      "signaling_port": 6668,
+      "enabled": true,
+      "ip_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_IP",
+      "local_key_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_KEY",
+      "password_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_PASSWORD"
+    },
+    {
+      "id": "synthetic-device-preconnect-001",
+      "name": "example-preconnect-camera",
+      "lan_protocol": "3.4",
+      "rtc_mode": "preconnect",
+      "signaling_port": 6668,
+      "enabled": true,
+      "ip_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_IP",
+      "local_key_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_KEY",
+      "password_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_PASSWORD"
+    }
+  ]
+}
