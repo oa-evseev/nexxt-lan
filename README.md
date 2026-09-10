@@ -11,9 +11,9 @@ preview startup, media parsing, optional playback, and graceful disconnect.
 
 ## Installation
 
-Python 3.10 or newer is required.
-Installing from source also requires a C compiler; the native KCP extension is
-built automatically by the normal Python package installation.
+Python 3.10 or newer is required. The default installation needs no C
+compiler: it uses the portable pure-Python KCP implementation when the
+optional native extension is absent.
 
 ```sh
 python3 -m venv .venv
@@ -21,11 +21,50 @@ python3 -m venv .venv
 python -m pip install .
 ```
 
+For the preferred CFFI binding of upstream KCP, install the native extra in a
+build environment with a C compiler. Published native wheels use it
+automatically; when building from a checkout, install CFFI first, then build
+without an isolated build environment so the extension is included:
+
+```sh
+python -m pip install 'setuptools>=68' 'cffi>=1.15'
+python -m pip install --no-build-isolation '.[native]'
+```
+
+Run the installed `nexxt-lan` command after this installation. Running
+`python nexxt_lan.py` directly from a checkout shadows the installed package
+with the source tree, which does not contain the wheel's compiled extension.
+For direct-from-checkout native development, build it in place first:
+
+```sh
+python setup.py build_ext --inplace
+```
+
 Install optional TinyTuya discovery support with:
 
 ```sh
 python -m pip install '.[discovery]'
 ```
+
+## KCP backend selection
+
+KCP uses the native implementation when it is installed and otherwise falls
+back to Python. Integration tests or an embedding application can explicitly
+select the backend for subsequently created implicit KCP instances:
+
+```python
+from tuya_p2p.kcp import set_default_backend, using_backend
+
+set_default_backend("python")  # process-wide; pass "auto" to reset
+
+with using_backend("native"):
+    ...  # restored even if the enclosed operation raises
+```
+
+An explicit `KCP(..., backend="python")` always overrides this default.
+The CLI exposes the same process-wide choice as
+`--kcp-backend auto|native|python`; for example, append `--kcp-backend python`
+to run the complete client without the native extension.
 
 `ffplay` is an optional external executable. It is needed only for `--play`
 and is not installed as a Python dependency.

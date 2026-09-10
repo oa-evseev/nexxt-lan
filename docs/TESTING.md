@@ -9,7 +9,7 @@ All fixtures are synthetic and tests perform no live device or Internet I/O.
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[test]'
+python -m pip install -e '.[dev]'
 ```
 
 Run the full production suite:
@@ -17,6 +17,10 @@ Run the full production suite:
 ```sh
 python -m pytest -q
 ```
+
+The KCP behavior suite selects both installed implementations. The `dev` extra
+includes CFFI, so an editable install with a compiler builds the native
+extension; a `test`-only or base environment exercises the Python fallback.
 
 Run protocol/live-path coverage:
 

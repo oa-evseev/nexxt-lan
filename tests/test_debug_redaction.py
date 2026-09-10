@@ -1,6 +1,9 @@
 import logging
 
 import nexxt_lan
+import pytest
+from tuya_p2p.channel import Mode3Channel
+from tuya_p2p.kcp import get_default_backend, native_available, set_default_backend
 
 SESSION_TOKEN = "synthetic-device1700000000AbCd1234"
 ICE_PASSWORD = "AbCdEfGhIjKlMnOpQrStUvWx"
@@ -74,6 +77,56 @@ def test_preconnect_activate_delay_cli_defaults_to_zero_and_accepts_milliseconds
         ).preconnect_activate_delay_ms
         == 25
     )
+
+
+def test_kcp_backend_cli_defaults_to_auto_and_accepts_explicit_choice():
+    assert nexxt_lan.parse_args(CLI_BASE).kcp_backend == "auto"
+    assert (
+        nexxt_lan.parse_args([*CLI_BASE, "--kcp-backend", "python"]).kcp_backend
+        == "python"
+    )
+
+
+def test_cli_python_backend_selection_reaches_upper_level_channel():
+    previous = get_default_backend()
+    try:
+        args = nexxt_lan.parse_args([*CLI_BASE, "--kcp-backend", "python"])
+        nexxt_lan.apply_kcp_backend(args.kcp_backend)
+        channel = Mode3Channel(key=bytes(16), conv=1, output=lambda _: None)
+        assert type(channel.kcp).__name__ == "PythonKCP"
+    finally:
+        set_default_backend(previous)
+
+
+def test_cli_native_backend_reports_unavailable_extension():
+    previous = get_default_backend()
+    try:
+        if native_available():
+            nexxt_lan.apply_kcp_backend("native")
+            channel = Mode3Channel(key=bytes(16), conv=1, output=lambda _: None)
+            assert type(channel.kcp).__name__ == "NativeKCP"
+        else:
+            with pytest.raises(RuntimeError, match="native KCP backend is unavailable"):
+                nexxt_lan.apply_kcp_backend("native")
+    finally:
+        set_default_backend(previous)
+
+
+def test_cli_main_exits_clearly_when_requested_native_backend_is_unavailable(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(nexxt_lan, "native_available", lambda: False)
+    monkeypatch.setattr(
+        nexxt_lan.sys,
+        "argv",
+        ["nexxt-lan", *CLI_BASE, "--kcp-backend", "native"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        nexxt_lan.main()
+
+    assert exc_info.value.code == 2
+    assert "native KCP backend is unavailable" in capsys.readouterr().err
 
 
 def test_safe_json_keeps_sdp_readable():

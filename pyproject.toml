@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "cffi>=1.15"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,14 +10,14 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
-    "cffi>=1.15",
     "cryptography>=41",
 ]
 
 [project.optional-dependencies]
 discovery = ["tinytuya>=1.20"]
+native = ["cffi>=1.15"]
 test = ["pytest>=8"]
-dev = ["pytest>=8", "black>=24"]
+dev = ["pytest>=8", "black>=24", "cffi>=1.15"]
 
 [project.scripts]
 nexxt-lan = "nexxt_lan:main"

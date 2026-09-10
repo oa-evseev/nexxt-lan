@@ -1,7 +1,7 @@
 import pytest
 
 from tuya_p2p.channel import Mode3Channel
-from tuya_p2p.kcp import KCPConfig
+from tuya_p2p.kcp import KCPConfig, native_available, using_backend
 
 KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
 IV = bytes.fromhex("ffeeddccbbaa99887766554433221100")
@@ -27,6 +27,15 @@ def test_two_channels_roundtrip():
 
     b.update(0)
     assert b.recv() == message
+
+
+@pytest.mark.skipif(not native_available(), reason="native KCP extension is not built")
+def test_global_python_backend_override_reaches_mode3_channel():
+    """A normal upper-level construction must not select native under override."""
+    with using_backend("python"):
+        channel = Mode3Channel(key=KEY, conv=1, output=lambda _: None)
+
+    assert type(channel.kcp).__name__ == "PythonKCP"
 
 
 def test_channel_fragments_and_reassembles_out_of_order_datagrams():

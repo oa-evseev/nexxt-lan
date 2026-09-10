@@ -70,6 +70,7 @@ from tuya_p2p import (
     Mode3Codec,
     build_auth_info,
 )
+from tuya_p2p.kcp import KCPBackend, native_available, set_default_backend
 
 # Signaling is event-driven: local ICE candidates are
 # trickled while answers and remote candidates are consumed. Keep these
@@ -2733,6 +2734,16 @@ def non_negative_integer(value: str) -> int:
     return parsed
 
 
+def apply_kcp_backend(backend: KCPBackend) -> None:
+    """Apply the CLI's process-wide KCP selection before session setup."""
+    if backend == "native" and not native_available():
+        raise RuntimeError(
+            "--kcp-backend native was requested, but the native KCP backend is "
+            "unavailable; install nexxt-lan[native] with a supported native build"
+        )
+    set_default_backend(backend)
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     """Parse command-line options without starting the LAN workflow."""
     parser = argparse.ArgumentParser(
@@ -2765,6 +2776,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=[mode.value for mode in RTCMode],
         default=None,
         help="override the configured RTC startup mode (diagnostic use only)",
+    )
+    parser.add_argument(
+        "--kcp-backend",
+        choices=("auto", "native", "python"),
+        default="auto",
+        help="KCP implementation for this process (default: auto)",
     )
     parser.add_argument(
         "--preconnect-activate-delay-ms",
@@ -2800,6 +2817,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     try:
+        apply_kcp_backend(args.kcp_backend)
         config = load_config(args.config)
         client, camera = resolve_runtime_config(config, args.camera)
         rtc_mode = resolve_rtc_mode(camera, args.rtc_mode)
