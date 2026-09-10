@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from collections import Counter, deque
 from contextlib import ExitStack
 from datetime import datetime
@@ -23,7 +24,7 @@ import sys
 import threading
 import time
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -36,7 +37,11 @@ from nexxt.udp_protocol import (
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from nexxt.config import (
     ConfigFile,
+    assemble_camera_config,
     load_config,
+    resolve_client_config,
+    resolve_device_credentials,
+    resolve_device_runtime,
     resolve_rtc_mode,
     resolve_runtime_config,
     select_camera,
@@ -73,6 +78,7 @@ from nexxt.media import (
     parse_media_record,
 )
 from nexxt.rtsp import RtspPublisher, RtspPublisherThread
+from nexxt.serve import build_serve_cameras, run_serve
 
 from tuya_p2p import (
     KCP,
@@ -215,27 +221,56 @@ class PreparedSession:
 class LocalStunServer:
     """Small LAN-only STUN responder for the endpoint advertised in offer."""
 
-    def __init__(self, host: str, port: int, password: str) -> None:
+    def __init__(self, host: str, port: int, password: Optional[str] = None) -> None:
         self._password = password
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.bind((host, port))
         self._socket.settimeout(0.1)
         self._stop = threading.Event()
+        self._started = False
+        self._closed = False
         self._thread = threading.Thread(
             target=self._serve,
             name="local-stun",
             daemon=True,
         )
 
-    def __enter__(self) -> LocalStunServer:
+    @property
+    def port(self) -> int:
+        """The actual bound port, including an OS-assigned ephemeral port."""
+        return self._socket.getsockname()[1]
+
+    def start(self, password: Optional[str] = None) -> None:
+        """Start after the offer has supplied this endpoint's ICE password."""
+        if password is not None:
+            if self._password is not None and self._password != password:
+                raise RuntimeError("Local STUN server password cannot be replaced")
+            self._password = password
+        if self._password is None:
+            raise RuntimeError("Local STUN server requires an ICE password")
+        if self._started:
+            return
+        if self._closed:
+            raise RuntimeError("Local STUN server is already closed")
         host, port = self._socket.getsockname()
         LOG.info("[status] Local STUN listening at %s:%d", host, port)
         self._thread.start()
+        self._started = True
+
+    def __enter__(self) -> LocalStunServer:
+        self.start()
         return self
 
     def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._stop.set()
-        self._thread.join(timeout=0.2)
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.2)
         self._socket.close()
 
     def _serve(self) -> None:
@@ -920,6 +955,22 @@ def open_udp_candidate(client: ClientConfig) -> socket.socket:
     )
     udp.bind((client.local_ip, 0))
     return udp
+
+
+def open_local_stun_endpoint(
+    client: ClientConfig, *, port: Optional[int] = None
+) -> tuple[LocalStunServer, ClientConfig]:
+    """Reserve a local STUN endpoint and return its offer-specific client view.
+
+    Binding occurs before constructing an offer, so an ephemeral port is both
+    collision-free across concurrent sessions and accurately advertised in its
+    STUN URL.  The caller starts the responder only after ``prepare_session``
+    has generated the endpoint's unique ICE password.
+    """
+    server = LocalStunServer(
+        client.local_ip, client.stun_port if port is None else port
+    )
+    return server, replace(client, stun_port=server.port)
 
 
 def send_heartbeat(
@@ -1959,6 +2010,7 @@ def run_udp_loop(
     ffplay_path: Optional[str] = None,
     media_sinks: tuple[MediaSink, ...] | list[MediaSink] = (),
     on_prepared: Optional[Callable[[], None]] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     LOG.info("[status] Waiting for ICE nomination " "(preview startup is not sent yet)")
 
@@ -2036,6 +2088,9 @@ def run_udp_loop(
 
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                LOG.info("[status] Camera shutdown requested")
+                return
             now = now_ms()
             startup_channel.update(now)
             for receiver in media_receivers.values():
@@ -2553,10 +2608,15 @@ def run_lan_preview(
     rtc_mode: RTCMode = RTCMode.DIRECT,
     preconnect_activate_delay_ms: int = 0,
     rtsp_listen: Optional[tuple[str, int]] = None,
+    media_sinks: tuple[MediaSink, ...] | list[MediaSink] = (),
+    stop_event: Optional[threading.Event] = None,
+    configure_logging: bool = True,
+    local_stun_port: Optional[int] = None,
 ) -> None:
     """Run the complete LAN signaling, ICE and encrypted preview workflow."""
     debug_enabled = debug or debug_unsafe
-    configure_output(debug=debug_enabled, debug_unsafe=debug_unsafe)
+    if configure_logging:
+        configure_output(debug=debug_enabled, debug_unsafe=debug_unsafe)
     LOG.info(
         "[status] Selected camera %s (%s) at %s:%d",
         camera.name,
@@ -2576,25 +2636,30 @@ def run_lan_preview(
         LOG.info("[status] RTSP stream available at %s", url)
 
     try:
-        session = prepare_session(
-            client=client,
-            camera=camera,
-            debug=debug_enabled,
-            debug_unsafe=debug_unsafe,
-            rtc_mode=rtc_mode,
-        )
-
         # The offer advertises this endpoint as its only STUN server.  Keep the
         # responder alive for the entire signaling/ICE exchange, so that the
         # advertised LAN endpoint is real rather than merely descriptive JSON.
         with ExitStack() as stack:
-            primary_udp = stack.enter_context(open_udp_candidate(client))
-            udp_sockets = [primary_udp, stack.enter_context(open_udp_candidate(client))]
-            stack.enter_context(
-                LocalStunServer(client.local_ip, client.stun_port, session.ice_password)
+            stun_server, session_client = open_local_stun_endpoint(
+                client, port=local_stun_port
             )
+            stack.callback(stun_server.close)
+            session = prepare_session(
+                client=session_client,
+                camera=camera,
+                debug=debug_enabled,
+                debug_unsafe=debug_unsafe,
+                rtc_mode=rtc_mode,
+            )
+            stun_server.start(session.ice_password)
+            primary_udp = stack.enter_context(open_udp_candidate(client))
+            udp_sockets = [
+                primary_udp,
+                stack.enter_context(open_udp_candidate(client)),
+            ]
             candidates = [
-                build_local_candidate(session, client, udp) for udp in udp_sockets
+                build_local_candidate(session, session_client, udp)
+                for udp in udp_sockets
             ]
 
             with open_signaling_connection(camera) as sock:
@@ -2633,7 +2698,11 @@ def run_lan_preview(
                         dump_media=dump_media,
                         play=play,
                         ffplay_path=ffplay_path,
-                        media_sinks=[media_stream] if media_stream is not None else [],
+                        media_sinks=[
+                            *media_sinks,
+                            *([media_stream] if media_stream is not None else []),
+                        ],
+                        stop_event=stop_event,
                         **udp_kwargs,
                     )
                 except KeyboardInterrupt:
@@ -2685,11 +2754,7 @@ def apply_kcp_backend(backend: KCPBackend) -> None:
     set_default_backend(backend)
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Parse command-line options without starting the LAN workflow."""
-    parser = argparse.ArgumentParser(
-        description="Connect to a Nexxt camera through the LAN P2P workflow."
-    )
+def _add_debug_options(parser: argparse.ArgumentParser) -> None:
     debug_options = parser.add_mutually_exclusive_group()
     debug_options.add_argument(
         "--debug",
@@ -2701,6 +2766,48 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="show unredacted technical diagnostics (may expose secrets)",
     )
+
+
+def _add_kcp_backend(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--kcp-backend",
+        choices=("auto", "native", "python"),
+        default="auto",
+        help="KCP implementation for this process (default: auto)",
+    )
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse command-line options without starting the LAN workflow."""
+    parser = argparse.ArgumentParser(
+        description="Connect to a Nexxt camera through the LAN P2P workflow."
+    )
+    # Keep the established no-subcommand form fully compatible.  ``serve``
+    # is detected before constructing that parser so its repeatable --camera
+    # can have different semantics.
+    parsed_argv = list(sys.argv[1:] if argv is None else argv)
+    if parsed_argv[:1] == ["serve"]:
+        serve = argparse.ArgumentParser(
+            description="Publish configured Nexxt cameras through one RTSP listener."
+        )
+        _add_debug_options(serve)
+        serve.add_argument("--config", type=Path, required=True)
+        serve.add_argument(
+            "--camera",
+            action="append",
+            default=[],
+            metavar="NAME",
+            help=(
+                "publish only this RTSP-enabled camera; repeatable. "
+                "If omitted, publish all RTSP-enabled cameras."
+            ),
+        )
+        serve.add_argument("--rtsp-listen", type=parse_rtsp_listen, required=True)
+        _add_kcp_backend(serve)
+        serve.set_defaults(command="serve")
+        return serve.parse_args(parsed_argv[1:])
+
+    _add_debug_options(parser)
     parser.add_argument(
         "--config",
         type=Path,
@@ -2718,12 +2825,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="override the configured RTC startup mode (diagnostic use only)",
     )
-    parser.add_argument(
-        "--kcp-backend",
-        choices=("auto", "native", "python"),
-        default="auto",
-        help="KCP implementation for this process (default: auto)",
-    )
+    _add_kcp_backend(parser)
     parser.add_argument(
         "--preconnect-activate-delay-ms",
         type=non_negative_integer,
@@ -2756,6 +2858,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="publish HEVC and PCM as RTSP (for example 127.0.0.1:8554)",
     )
     args = parser.parse_args(argv)
+    args.command = "preview"
     if args.play and shutil.which("ffplay") is None:
         parser.error("--play requires ffplay in PATH")
     return args
@@ -2766,6 +2869,51 @@ def main() -> None:
     try:
         apply_kcp_backend(args.kcp_backend)
         config = load_config(args.config)
+        if args.command == "serve":
+            configure_output(
+                debug=args.debug or args.debug_unsafe, debug_unsafe=args.debug_unsafe
+            )
+            client = resolve_client_config(config)
+            cameras = build_serve_cameras(
+                config,
+                args.camera,
+                lambda profile: assemble_camera_config(
+                    profile,
+                    resolve_device_runtime(profile),
+                    resolve_device_credentials(profile),
+                ),
+            )
+
+            def run_camera_session(
+                shared_client: ClientConfig,
+                camera: CameraConfig,
+                stream: MediaStream,
+                stop_event: threading.Event,
+            ) -> None:
+                run_lan_preview(
+                    client=shared_client,
+                    camera=camera,
+                    debug=args.debug,
+                    debug_unsafe=args.debug_unsafe,
+                    rtc_mode=resolve_rtc_mode(camera),
+                    preconnect_activate_delay_ms=0,
+                    media_sinks=[stream],
+                    stop_event=stop_event,
+                    configure_logging=False,
+                    # Each concurrent offer advertises the OS-selected STUN
+                    # endpoint reserved specifically for this camera.
+                    local_stun_port=0,
+                )
+
+            asyncio.run(
+                run_serve(
+                    client=client,
+                    cameras=cameras,
+                    listen=args.rtsp_listen,
+                    run_session=run_camera_session,
+                )
+            )
+            return
         client, camera = resolve_runtime_config(config, args.camera)
         rtc_mode = resolve_rtc_mode(camera, args.rtc_mode)
         run_lan_preview(

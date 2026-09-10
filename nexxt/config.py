@@ -43,6 +43,14 @@ def _environment_value(env_name: str, description: str) -> str:
 
 def _device_config(raw: dict[str, object]) -> DeviceConfig:
     name = _required_string(raw.get("name"), "config camera.name")
+    rtsp_enabled = raw.get("rtsp", False)
+    if not isinstance(rtsp_enabled, bool):
+        raise RuntimeError(f"config camera {name!r}.rtsp must be a boolean")
+    rtsp_path = (
+        _required_string(raw["rtsp_path"], f"config camera {name!r}.rtsp_path")
+        if "rtsp_path" in raw and raw["rtsp_path"] is not None
+        else (name if rtsp_enabled else None)
+    )
     return DeviceConfig(
         id=_required_string(raw.get("id"), f"config camera {name!r}.id"),
         name=name,
@@ -59,6 +67,7 @@ def _device_config(raw: dict[str, object]) -> DeviceConfig:
         password_env=_required_string(
             raw.get("password_env"), f"config camera {name!r}.password_env"
         ),
+        rtsp_path=rtsp_path,
     )
 
 
@@ -99,6 +108,38 @@ def select_camera(config: ConfigFile, selector: str) -> DeviceConfig:
     if camera.enabled is not True:
         raise RuntimeError(f"camera {selector!r} is disabled")
     return camera
+
+
+def select_serve_cameras(
+    config: ConfigFile, selectors: tuple[str, ...] | list[str] = ()
+) -> tuple[DeviceConfig, ...]:
+    """Return RTSP-enabled profiles, optionally restricted by camera name.
+
+    With no filter, every explicitly RTSP-enabled profile is selected. A
+    profile remains opt-in: ``rtsp_path`` is required even when a CLI filter
+    is supplied.
+    """
+    requested = tuple(selectors)
+    if requested:
+        selected = tuple(select_camera(config, selector) for selector in requested)
+        names = [camera.name for camera in selected]
+        if len(set(names)) != len(names):
+            raise RuntimeError("a camera was selected more than once")
+    else:
+        selected = tuple(
+            camera
+            for camera in config.cameras
+            if camera.enabled is True and camera.rtsp_path is not None
+        )
+    missing = [camera.name for camera in selected if camera.rtsp_path is None]
+    if missing:
+        raise RuntimeError(
+            "camera(s) are not enabled for serve (missing rtsp_path): "
+            + ", ".join(missing)
+        )
+    if not selected:
+        raise RuntimeError("no RTSP-enabled cameras selected (set camera.rtsp_path)")
+    return selected
 
 
 def resolve_rtc_mode(

@@ -94,6 +94,11 @@ environment-variable names for its current IP, local key, and password. The
 client section declares environment-variable names for client ID, bind IP,
 and STUN port. See `config.example.json` for the version 1 schema.
 
+For the foreground multi-camera runner, opt a profile in by adding
+`"rtsp_path": "laundry"`.  Alternatively, `"rtsp": true` opts it in and
+uses the camera name as its path. Profiles without either setting are never
+published by `serve`, even if they are enabled. Paths are one URL-safe segment.
+
 TinyTuya discovery is optional and imported only when its resolver is used.
 The configured environment resolver remains the default CLI behavior.
 
@@ -122,6 +127,22 @@ Useful diagnostics are explicit opt-ins:
   `--rtsp-listen 127.0.0.1:8554`; to expose it on the LAN, bind the intended
   interface address explicitly.
 - `--debug-unsafe` enables unredacted tracing.
+
+To publish multiple opt-in profiles through one listener, use the `serve`
+subcommand. With no `--camera` it publishes all RTSP-enabled profiles; each
+repeatable `--camera NAME` restricts that set (and does not opt an otherwise
+private profile in):
+
+```sh
+nexxt-lan serve --config /path/to/private/nexxt-config.json \
+  --camera example-direct-camera --camera example-preconnect-camera \
+  --rtsp-listen 127.0.0.1:8554
+```
+
+Each `serve` camera reserves its own OS-assigned local STUN port before its
+offer is generated. That port is advertised only in that camera's STUN URL;
+the configured `stun_port_env` remains the fixed-port behavior for the legacy
+single-camera command.
 
 `--debug-unsafe` and `--dump-media` can disclose credentials, identifiers,
 session material, network details, audio, and video. Use private output

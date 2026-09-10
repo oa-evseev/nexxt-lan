@@ -26,6 +26,10 @@ class DeviceConfig:
     ip_env: str
     local_key_env: str
     password_env: str
+    # Presence opts a camera into the foreground multi-camera RTSP runner.
+    # Keep this on the existing profile, rather than introducing duplicate
+    # camera definitions in a separate service-specific config section.
+    rtsp_path: str | None = None
 
     # ``select_camera`` historically returned a JSON object.  Retain the
     # small mapping surface used by programmatic callers during this step.

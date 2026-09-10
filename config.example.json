@@ -13,6 +13,7 @@
       "rtc_mode": "direct",
       "signaling_port": 6668,
       "enabled": true,
+      "rtsp_path": "example-direct-camera",
       "ip_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_IP",
       "local_key_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_KEY",
       "password_env": "NEXXT_EXAMPLE_DIRECT_CAMERA_PASSWORD"
@@ -24,6 +25,7 @@
       "rtc_mode": "preconnect",
       "signaling_port": 6668,
       "enabled": true,
+      "rtsp_path": "example-preconnect-camera",
       "ip_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_IP",
       "local_key_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_KEY",
       "password_env": "NEXXT_EXAMPLE_PRECONNECT_CAMERA_PASSWORD"
