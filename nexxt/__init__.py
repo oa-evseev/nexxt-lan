@@ -7,7 +7,7 @@ from .media import (
     MediaStream,
     VideoChunk,
 )
-from .rtsp import RtspPublisher
+from .rtsp import RtspPublisher, RtspServer
 
 __all__ = [
     "AudioChunk",
@@ -15,5 +15,6 @@ __all__ = [
     "MediaSink",
     "MediaStream",
     "RtspPublisher",
+    "RtspServer",
     "VideoChunk",
 ]

@@ -1,8 +1,8 @@
-"""Small asyncio RTSP 1.0 publisher for a :mod:`nexxt.media` stream.
+"""A small multi-publication asyncio RTSP 1.0 server.
 
-The server deliberately implements the publishing subset needed by ordinary
-RTSP players.  Media can use RTP over RTSP/TCP or unicast UDP; RTCP reception,
-recording, authentication and multicast are outside its scope.
+One listener can publish independent :class:`nexxt.media.MediaStream` objects
+at distinct paths. The implementation intentionally covers the playback
+subset used by ordinary RTSP clients: RTP over RTSP/TCP and unicast UDP.
 """
 
 from __future__ import annotations
@@ -18,11 +18,13 @@ import struct
 import threading
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from .media import AudioChunk, MediaStream, MediaSubscription, VideoChunk
 
 LOG = logging.getLogger("nexxt_lan")
 MAX_CLIENT_WRITE_BUFFER = 2 * 1024 * 1024
+_PUBLICATION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~-]*\Z")
 
 
 def _rtp_header(
@@ -39,6 +41,8 @@ def _rtp_header(
 
 
 class _RtpTrack:
+    """RTP state owned by one track of one RTSP client."""
+
     def __init__(self, payload_type: int, clock_rate: int) -> None:
         self.payload_type = payload_type
         self.clock_rate = clock_rate
@@ -92,8 +96,8 @@ class _RtpTrack:
         return packets
 
     def pcm(self, chunk: AudioChunk, mtu: int = 1200) -> list[bytes]:
-        # RTP L16 is network-byte-order.  This is lossless repacketization of
-        # the camera's signed little-endian samples, not transcoding.
+        # RTP L16 is network-byte-order. This is lossless repacketization,
+        # not transcoding the camera's signed little-endian PCM.
         even_length = len(chunk.data) & ~1
         little = chunk.data[:even_length]
         network = bytearray(even_length)
@@ -113,6 +117,7 @@ class _Client:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     session_id: str = field(default_factory=lambda: f"{random.randrange(2**64):016x}")
+    publication: Optional["_Publication"] = None
     playing: bool = False
     waiting_for_irap: bool = True
     transports: dict[int, tuple[str, object]] = field(default_factory=dict)
@@ -127,84 +132,132 @@ class _Client:
         self.transports.clear()
 
 
-class RtspPublisher:
-    """Publish one :class:`MediaStream` as an RTSP path.
+@dataclass(eq=False)
+class _Publication:
+    path: str
+    stream: MediaStream
+    subscription: MediaSubscription
+    clients: set[_Client] = field(default_factory=set)
+    parameter_sets: dict[int, VideoChunk] = field(default_factory=dict)
+    task: Optional[asyncio.Task[None]] = None
 
-    The camera stream stays alive independently of RTSP clients.  Every new
-    client waits for the next IRAP NAL; cached VPS/SPS/PPS are injected just
-    before it so joining mid-session has a clean decoder entry point.
+
+class RtspServer:
+    """One RTSP listener with independently managed stream publications.
+
+    Paths are single URL-safe segments such as ``laundry`` or ``/cat-feeder``;
+    both normalize to a leading-slash URL path. Duplicate publication paths are
+    rejected instead of replacing a live camera stream accidentally.
     """
 
-    def __init__(
-        self, host: str = "127.0.0.1", port: int = 8554, path: str = "/stream"
-    ) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8554) -> None:
         self.host, self.port = host, port
-        self.path = "/" + path.strip("/")
         self._server: Optional[asyncio.AbstractServer] = None
-        self._task: Optional[asyncio.Task[None]] = None
-        self._clients: set[_Client] = set()
-        self._parameter_sets: dict[int, VideoChunk] = {}
-        self._stream: Optional[MediaStream] = None
+        self._publications: dict[str, _Publication] = {}
+        self._connections: set[_Client] = set()
+
+    @staticmethod
+    def normalize_path(path: str) -> str:
+        if not isinstance(path, str):
+            raise TypeError("RTSP publication path must be a string")
+        if not path or path != path.strip():
+            raise ValueError("RTSP publication path must not be empty or padded")
+        normalized = path if path.startswith("/") else "/" + path
+        if normalized.count("/") != 1 or not _PUBLICATION_NAME.fullmatch(
+            normalized[1:]
+        ):
+            raise ValueError(
+                "RTSP publication path must be one URL-safe segment "
+                "(letters, digits, '.', '_', '~', '-')"
+            )
+        return normalized
 
     @property
-    def url(self) -> str:
+    def running(self) -> bool:
+        return self._server is not None
+
+    @property
+    def publications(self) -> tuple[str, ...]:
+        return tuple(self._publications)
+
+    def url(self, path: str) -> str:
+        normalized = self.normalize_path(path)
         host = (
             f"[{self.host}]"
             if ":" in self.host and not self.host.startswith("[")
             else self.host
         )
-        return f"rtsp://{host}:{self.port}{self.path}"
+        return f"rtsp://{host}:{self.port}{normalized}"
 
-    async def start(self, stream: MediaStream) -> str:
+    async def start(self) -> None:
         if self._server is not None:
-            return self.url
-        self._stream = stream
+            return
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
-        socket_name = self._server.sockets[0].getsockname()
         if self.port == 0:
-            self.port = socket_name[1]
-        # Subscribe before returning so parameter sets arriving immediately
-        # after startup cannot fall into a task-scheduling gap.
-        subscription = stream.subscribe()
-        self._task = asyncio.create_task(
-            self._consume(subscription), name="nexxt-rtsp-media"
-        )
-        return self.url
+            self.port = self._server.sockets[0].getsockname()[1]
 
-    async def publish(self, stream: MediaStream) -> str:
-        return await self.start(stream)
+    async def publish(self, path: str, stream: MediaStream) -> str:
+        if self._server is None:
+            raise RuntimeError("start RtspServer before publishing streams")
+        normalized = self.normalize_path(path)
+        if normalized in self._publications:
+            raise ValueError(f"RTSP publication already exists: {normalized}")
+        # Subscribe before returning so first camera parameter sets cannot
+        # disappear in a task scheduling gap.
+        publication = _Publication(normalized, stream, stream.subscribe())
+        publication.task = asyncio.create_task(
+            self._consume(publication), name=f"nexxt-rtsp-media:{normalized[1:]}"
+        )
+        self._publications[normalized] = publication
+        return self.url(normalized)
+
+    async def unpublish(self, path: str) -> None:
+        normalized = self.normalize_path(path)
+        publication = self._publications.pop(normalized, None)
+        if publication is None:
+            raise KeyError(f"RTSP publication does not exist: {normalized}")
+        if publication.task is not None:
+            publication.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await publication.task
+        await publication.subscription.close()
+        clients = list(publication.clients)
+        publication.clients.clear()
+        for client in clients:
+            client.playing = False
+            client.close_transports()
+            client.writer.close()
 
     async def stop(self) -> None:
         server, self._server = self._server, None
         if server is not None:
             server.close()
-            await server.wait_closed()
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        clients, self._clients = list(self._clients), set()
+        # Connections which have not selected a publication are still owned by
+        # the listener and must not survive a server shutdown. Close them
+        # before waiting for the listener: asyncio's wait_closed() can wait
+        # for handlers that are blocked reading from a still-open client.
+        clients = list(self._connections)
         for client in clients:
             client.close_transports()
             client.writer.close()
-        for client in clients:
-            with contextlib.suppress(Exception):
-                await client.writer.wait_closed()
+        if server is not None:
+            await server.wait_closed()
+        for path in list(self._publications):
+            await self.unpublish(path)
 
-    async def _consume(self, subscription: MediaSubscription) -> None:
+    async def _consume(self, publication: _Publication) -> None:
         try:
-            async for chunk in subscription:
+            async for chunk in publication.subscription:
                 if isinstance(chunk, VideoChunk):
                     if chunk.is_parameter_set:
-                        self._parameter_sets[chunk.nal_type] = chunk
-                    self._broadcast_video(chunk)
+                        publication.parameter_sets[chunk.nal_type] = chunk
+                    self._broadcast_video(publication, chunk)
                 else:
-                    self._broadcast_audio(chunk)
+                    self._broadcast_audio(publication, chunk)
         finally:
-            await subscription.close()
+            await publication.subscription.close()
 
     def _send(self, client: _Client, track: int, packet: bytes) -> None:
         transport = client.transports.get(track)
@@ -233,15 +286,15 @@ class RtspPublisher:
         except (ConnectionError, OSError):
             client.playing = False
 
-    def _broadcast_video(self, chunk: VideoChunk) -> None:
-        for client in tuple(self._clients):
+    def _broadcast_video(self, publication: _Publication, chunk: VideoChunk) -> None:
+        for client in tuple(publication.clients):
             if not client.playing or 0 not in client.transports:
                 continue
             if client.waiting_for_irap:
                 if not chunk.is_irap:
                     continue
                 for nal_type in (32, 33, 34):
-                    parameter = self._parameter_sets.get(nal_type)
+                    parameter = publication.parameter_sets.get(nal_type)
                     if parameter is not None:
                         for packet in client.video.hevc(parameter):
                             self._send(client, 0, packet)
@@ -249,19 +302,20 @@ class RtspPublisher:
             for packet in client.video.hevc(chunk):
                 self._send(client, 0, packet)
 
-    def _broadcast_audio(self, chunk: AudioChunk) -> None:
-        for client in tuple(self._clients):
+    def _broadcast_audio(self, publication: _Publication, chunk: AudioChunk) -> None:
+        for client in tuple(publication.clients):
             if client.playing and 1 in client.transports:
                 for packet in client.audio.pcm(chunk):
                     self._send(client, 1, packet)
 
-    def _sdp(self) -> bytes:
+    @staticmethod
+    def _sdp(publication: _Publication) -> bytes:
         fmtp = ""
         names = ((32, "sprop-vps"), (33, "sprop-sps"), (34, "sprop-pps"))
         values = [
-            f"{name}={base64.b64encode(self._parameter_sets[k].payload).decode()}"
+            f"{name}={base64.b64encode(publication.parameter_sets[k].payload).decode()}"
             for k, name in names
-            if k in self._parameter_sets
+            if k in publication.parameter_sets
         ]
         if values:
             fmtp = "a=fmtp:96 " + ";".join(values) + "\r\n"
@@ -300,11 +354,44 @@ class RtspPublisher:
         client.writer.write(head.encode() + body)
         await client.writer.drain()
 
+    @staticmethod
+    def _uri_path(uri: str) -> Optional[str]:
+        split = urlsplit(uri)
+        if split.query or split.fragment:
+            return None
+        try:
+            return unquote(split.path)
+        except UnicodeDecodeError:
+            return None
+
+    def _publication_for_uri(
+        self, uri: str, *, track: bool = False
+    ) -> tuple[Optional[_Publication], Optional[int]]:
+        path = self._uri_path(uri)
+        if path is None:
+            return None, None
+        if not track:
+            # Content-Base ends in a slash, and ffmpeg consequently sends an
+            # aggregate PLAY to ``/name/``. Treat that as the publication URL.
+            return self._publications.get(path.rstrip("/") or "/"), None
+        match = re.fullmatch(r"(/[^/]+)/trackID=([01])", path)
+        if match is None:
+            return None, None
+        return self._publications.get(match.group(1)), int(match.group(2))
+
+    def _bind_client(self, client: _Client, publication: _Publication) -> bool:
+        if client.publication is not None and client.publication is not publication:
+            return False
+        if client.publication is None:
+            client.publication = publication
+            publication.clients.add(client)
+        return True
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         client = _Client(reader, writer)
-        self._clients.add(client)
+        self._connections.add(client)
         peer = writer.get_extra_info("peername")
         LOG.info("[rtsp] client connected: %s", peer)
         try:
@@ -315,8 +402,6 @@ class RtspPublisher:
                     await reader.readexactly(struct.unpack(">H", interleaved[1:3])[0])
                     continue
                 request_line = first + await reader.readline()
-                if not request_line:
-                    break
                 parts = request_line.decode("latin1").strip().split()
                 if len(parts) != 3:
                     break
@@ -341,35 +426,61 @@ class RtspPublisher:
                         },
                     )
                 elif method == "DESCRIBE":
-                    await self._response(
-                        client,
-                        cseq,
-                        headers={
-                            "Content-Type": "application/sdp",
-                            "Content-Base": self.url + "/",
-                        },
-                        body=self._sdp(),
-                    )
+                    publication, _ = self._publication_for_uri(uri)
+                    if publication is None:
+                        await self._response(client, cseq, "404 Not Found")
+                    elif not self._bind_client(client, publication):
+                        await self._response(
+                            client, cseq, "459 Aggregate Operation Not Allowed"
+                        )
+                    else:
+                        await self._response(
+                            client,
+                            cseq,
+                            headers={
+                                "Content-Type": "application/sdp",
+                                "Content-Base": self.url(publication.path) + "/",
+                            },
+                            body=self._sdp(publication),
+                        )
                 elif method == "SETUP":
-                    track = 1 if uri.rstrip("/").endswith("trackID=1") else 0
+                    publication, track = self._publication_for_uri(uri, track=True)
+                    if publication is None or track is None:
+                        await self._response(client, cseq, "404 Not Found")
+                        continue
+                    if not self._bind_client(client, publication):
+                        await self._response(
+                            client, cseq, "459 Aggregate Operation Not Allowed"
+                        )
+                        continue
                     transport = headers.get("transport", "")
                     tcp = re.search(r"interleaved=(\d+)(?:-(\d+))?", transport, re.I)
                     udp = re.search(r"client_port=(\d+)(?:-(\d+))?", transport, re.I)
                     if tcp:
                         channel = int(tcp.group(1))
                         client.transports[track] = ("tcp", channel)
-                        response_transport = f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1};ssrc={(client.video if track == 0 else client.audio).ssrc:08X}"
+                        rtp_track = client.video if track == 0 else client.audio
+                        response_transport = (
+                            f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1};"
+                            f"ssrc={rtp_track.ssrc:08X}"
+                        )
                     elif udp:
-                        peer = writer.get_extra_info("peername")
-                        family = socket.AF_INET6 if ":" in peer[0] else socket.AF_INET
+                        udp_peer = writer.get_extra_info("peername")
+                        family = (
+                            socket.AF_INET6 if ":" in udp_peer[0] else socket.AF_INET
+                        )
                         rtp_socket = socket.socket(family, socket.SOCK_DGRAM)
                         rtp_socket.bind((self.host, 0))
                         server_port = rtp_socket.getsockname()[1]
                         client.transports[track] = (
                             "udp",
-                            (rtp_socket, (peer[0], int(udp.group(1)))),
+                            (rtp_socket, (udp_peer[0], int(udp.group(1)))),
                         )
-                        response_transport = f"RTP/AVP;unicast;client_port={udp.group(1)}-{udp.group(2) or int(udp.group(1)) + 1};server_port={server_port}-{server_port + 1}"
+                        response_transport = (
+                            "RTP/AVP;unicast;"
+                            f"client_port={udp.group(1)}-{udp.group(2) or int(udp.group(1)) + 1};"
+                            f"server_port={server_port}-{server_port + 1}"
+                        )
                     else:
                         await self._response(client, cseq, "461 Unsupported Transport")
                         continue
@@ -382,11 +493,17 @@ class RtspPublisher:
                         },
                     )
                 elif method == "PLAY":
-                    client.playing = True
-                    client.waiting_for_irap = True
-                    await self._response(
-                        client, cseq, headers={"Session": client.session_id}
-                    )
+                    publication, _ = self._publication_for_uri(uri)
+                    if publication is None:
+                        await self._response(client, cseq, "404 Not Found")
+                    elif client.publication is not publication:
+                        await self._response(client, cseq, "454 Session Not Found")
+                    else:
+                        client.playing = True
+                        client.waiting_for_irap = True
+                        await self._response(
+                            client, cseq, headers={"Session": client.session_id}
+                        )
                 elif method == "GET_PARAMETER":
                     await self._response(
                         client, cseq, headers={"Session": client.session_id}
@@ -401,12 +518,50 @@ class RtspPublisher:
         except (asyncio.IncompleteReadError, ConnectionError, ValueError):
             pass
         finally:
-            self._clients.discard(client)
+            self._connections.discard(client)
+            if client.publication is not None:
+                client.publication.clients.discard(client)
             client.close_transports()
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
             LOG.info("[rtsp] client disconnected: %s", peer)
+
+
+class RtspPublisher:
+    """Deprecated one-path compatibility wrapper around :class:`RtspServer`."""
+
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = 8554, path: str = "/stream"
+    ) -> None:
+        self.host, self.port = host, port
+        self.path = RtspServer.normalize_path(path)
+        self._rtsp_server: Optional[RtspServer] = None
+
+    @property
+    def _server(self) -> Optional[asyncio.AbstractServer]:
+        return self._rtsp_server._server if self._rtsp_server is not None else None
+
+    @property
+    def url(self) -> str:
+        if self._rtsp_server is not None:
+            return self._rtsp_server.url(self.path)
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"rtsp://{host}:{self.port}{self.path}"
+
+    async def start(self, stream: MediaStream) -> str:
+        if self._rtsp_server is None:
+            self._rtsp_server = RtspServer(self.host, self.port)
+            await self._rtsp_server.start()
+            self.port = self._rtsp_server.port
+            return await self._rtsp_server.publish(self.path, stream)
+        return self.url
+
+    async def publish(self, stream: MediaStream) -> str:
+        return await self.start(stream)
+
+    async def stop(self) -> None:
+        if self._rtsp_server is not None:
+            await self._rtsp_server.stop()
+            self._rtsp_server = None
 
 
 class RtspPublisherThread:

@@ -8,7 +8,7 @@ import time
 import pytest
 
 from nexxt.media import ANNEXB_START_CODE, AudioChunk, MediaStream, VideoChunk
-from nexxt.rtsp import RtspPublisher
+from nexxt.rtsp import RtspPublisher, RtspServer
 
 
 async def request(reader, writer, port, method, target, cseq, headers=()):
@@ -31,6 +31,184 @@ async def request(reader, writer, port, method, target, cseq, headers=()):
 def test_rtsp_url_uses_configured_bind_address():
     assert RtspPublisher("192.168.10.5", 8554).url == "rtsp://192.168.10.5:8554/stream"
     assert RtspPublisher("::1", 8554).url == "rtsp://[::1]:8554/stream"
+
+
+async def setup_and_play(server, path, *, cseq=1):
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    status, _, _ = await request(reader, writer, server.port, "DESCRIBE", path, cseq)
+    assert status.startswith(b"RTSP/1.0 200")
+    status, headers, _ = await request(
+        reader,
+        writer,
+        server.port,
+        "SETUP",
+        f"{path}/trackID=0",
+        cseq + 1,
+        ["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"],
+    )
+    assert status.startswith(b"RTSP/1.0 200")
+    session = headers["session"].split(";", 1)[0]
+    status, _, _ = await request(
+        reader, writer, server.port, "PLAY", path, cseq + 2, [f"Session: {session}"]
+    )
+    assert status.startswith(b"RTSP/1.0 200")
+    return reader, writer
+
+
+async def read_rtp(reader):
+    assert await reader.readexactly(1) == b"$"
+    channel = (await reader.readexactly(1))[0]
+    size = struct.unpack(">H", await reader.readexactly(2))[0]
+    return channel, await reader.readexactly(size)
+
+
+def test_rtsp_server_multiple_publications_are_isolated():
+    async def exercise():
+        laundry, feeder = MediaStream(), MediaStream()
+        server = RtspServer("127.0.0.1", 0)
+        await server.start()
+        assert await server.publish("laundry", laundry) == (
+            f"rtsp://127.0.0.1:{server.port}/laundry"
+        )
+        assert await server.publish("/cat-feeder", feeder) == (
+            f"rtsp://127.0.0.1:{server.port}/cat-feeder"
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            await server.publish("laundry", MediaStream())
+
+        sets_a = (b"\x40\x01a-vps", b"\x42\x01a-sps", b"\x44\x01a-pps")
+        sets_b = (b"\x40\x01b-vps", b"\x42\x01b-sps", b"\x44\x01b-pps")
+        for index, nal in enumerate(sets_a):
+            laundry.on_video(VideoChunk(ANNEXB_START_CODE + nal, index + 1))
+        for index, nal in enumerate(sets_b):
+            feeder.on_video(VideoChunk(ANNEXB_START_CODE + nal, index + 1))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        reader_a, writer_a = await asyncio.open_connection("127.0.0.1", server.port)
+        status, _, sdp_a = await request(
+            reader_a, writer_a, server.port, "DESCRIBE", "/laundry", 1
+        )
+        assert status.startswith(b"RTSP/1.0 200")
+        assert base64.b64encode(sets_a[0]) in sdp_a
+        assert base64.b64encode(sets_b[0]) not in sdp_a
+
+        reader_b, writer_b = await setup_and_play(server, "/cat-feeder", cseq=10)
+        status, headers_a, _ = await request(
+            reader_a,
+            writer_a,
+            server.port,
+            "SETUP",
+            "/laundry/trackID=0",
+            2,
+            ["Transport: RTP/AVP/TCP;unicast;interleaved=0-1"],
+        )
+        assert status.startswith(b"RTSP/1.0 200")
+        session_a = headers_a["session"].split(";", 1)[0]
+        await request(
+            reader_a,
+            writer_a,
+            server.port,
+            "PLAY",
+            "/laundry",
+            3,
+            [f"Session: {session_a}"],
+        )
+
+        publication_a = server._publications["/laundry"]
+        publication_b = server._publications["/cat-feeder"]
+        client_a = next(iter(publication_a.clients))
+        client_b = next(iter(publication_b.clients))
+        assert client_a.video is not client_b.video
+        feeder_sequence = client_b.video.sequence
+
+        # Each late client gets only its own parameter sets followed by its
+        # stream's next IRAP. Publishing A must not advance B's RTP state.
+        laundry.on_video(VideoChunk(ANNEXB_START_CODE + b"\x26\x01a-idr", 10))
+        assert client_b.video.sequence == feeder_sequence
+        feeder.on_video(VideoChunk(ANNEXB_START_CODE + b"\x26\x01b-idr", 11))
+        received_a = [await read_rtp(reader_a) for _ in range(4)]
+        received_b = [await read_rtp(reader_b) for _ in range(4)]
+        assert [packet[1][12:] for packet in received_a] == [
+            *sets_a,
+            b"\x26\x01a-idr",
+        ]
+        assert [packet[1][12:] for packet in received_b] == [
+            *sets_b,
+            b"\x26\x01b-idr",
+        ]
+        assert all(channel == 0 for channel, _packet in received_a + received_b)
+
+        writer_a.close()
+        writer_b.close()
+        await writer_a.wait_closed()
+        await writer_b.wait_closed()
+        await server.stop()
+        laundry.close()
+        feeder.close()
+
+    asyncio.run(exercise())
+
+
+def test_unpublish_is_path_scoped_and_unknown_paths_are_404():
+    async def exercise():
+        laundry, bedroom = MediaStream(), MediaStream()
+        server = RtspServer("127.0.0.1", 0)
+        await server.start()
+        await server.publish("laundry", laundry)
+        await server.publish("bedroom", bedroom)
+
+        unknown_reader, unknown_writer = await asyncio.open_connection(
+            "127.0.0.1", server.port
+        )
+        status, _, _ = await request(
+            unknown_reader, unknown_writer, server.port, "DESCRIBE", "/missing", 1
+        )
+        assert status.startswith(b"RTSP/1.0 404")
+        unknown_writer.close()
+        await unknown_writer.wait_closed()
+
+        for stream, suffix in ((laundry, b"a"), (bedroom, b"b")):
+            for nal_type, name in (
+                (b"\x40\x01", b"vps"),
+                (b"\x42\x01", b"sps"),
+                (b"\x44\x01", b"pps"),
+            ):
+                stream.on_video(
+                    VideoChunk(ANNEXB_START_CODE + nal_type + suffix + name, 1)
+                )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        reader_a, writer_a = await setup_and_play(server, "/laundry", cseq=10)
+        reader_b, writer_b = await setup_and_play(server, "/bedroom", cseq=20)
+
+        await server.unpublish("laundry")
+        assert "/laundry" not in server.publications
+        assert "/bedroom" in server.publications
+        assert await asyncio.wait_for(reader_a.read(1), timeout=1) == b""
+
+        # Bedroom remains live and still has its own late-join parameter cache.
+        bedroom.on_video(VideoChunk(ANNEXB_START_CODE + b"\x26\x01b-idr", 2))
+        packets_b = [await read_rtp(reader_b) for _ in range(4)]
+        assert packets_b[-1][1][12:] == b"\x26\x01b-idr"
+        with pytest.raises(KeyError, match="does not exist"):
+            await server.unpublish("laundry")
+
+        await server.stop()
+        assert await asyncio.wait_for(reader_b.read(1), timeout=1) == b""
+        assert not server.running
+        assert server.publications == ()
+        laundry.close()
+        bedroom.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("path", ["", " two", "two ", "/nested/path", "/", "a?b"])
+def test_rtsp_publication_paths_are_normalized_and_validated(path):
+    with pytest.raises(ValueError):
+        RtspServer.normalize_path(path)
+    assert RtspServer.normalize_path("cat-feeder") == "/cat-feeder"
 
 
 def test_rtsp_startup_sdp_late_join_and_shutdown():

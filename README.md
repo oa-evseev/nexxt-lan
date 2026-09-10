@@ -137,23 +137,28 @@ PCM s16le samples with 8000 Hz, mono and two-byte sample metadata. Synchronous
 turns those callbacks into a thread-safe broadcast whose subscriptions are
 async iterators.
 
-The RTSP API is independent of camera transport:
+The RTSP API is independent of camera transport. One `RtspServer` owns one
+listen socket and can publish multiple independent `MediaStream` instances:
 
 ```python
-from nexxt import MediaStream, RtspPublisher
+from nexxt import MediaStream, RtspServer
 
-stream = MediaStream()
-publisher = RtspPublisher("127.0.0.1", 8554)
-url = await publisher.publish(stream)
-# Attach stream as a sink to the camera's MediaPipeline.
+server = RtspServer("127.0.0.1", 8554)
+await server.start()
+
+laundry_url = await server.publish("laundry", laundry_stream)
+feeder_url = await server.publish("cat-feeder", feeder_stream)
+# Attach each stream as a sink to its camera's MediaPipeline.
 ...
-await publisher.stop()
+await server.unpublish("laundry")
+await server.stop()
 ```
 
-The CLI starts the publisher first, then one Nexxt session, and keeps that
-session running whether zero, one, or several RTSP clients are connected.
-Client disconnects only release client RTP state. Shutdown closes the media
-pipeline, performs the existing graceful camera disconnect and stops RTSP.
+Publication paths are normalized to one URL-safe segment (`laundry` becomes
+`/laundry`); duplicates are rejected. The existing `RtspPublisher` remains as
+a one-path compatibility wrapper for the CLI. Client disconnects only release
+that client's RTP state. Shutdown closes the media pipeline, performs the
+existing graceful camera disconnect and stops RTSP.
 
 The publisher caches the latest VPS, SPS and PPS. A newly playing client is
 held until the next HEVC IRAP NAL, then receives the cached parameter sets and
