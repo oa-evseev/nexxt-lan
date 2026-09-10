@@ -66,6 +66,12 @@ to run the complete client without the native extension.
 `ffplay` is an optional external executable. It is needed only for `--play`
 and is not installed as a Python dependency.
 
+RTSP publishing is built in and adds no external executable or Python
+dependency. The focused RTSP 1.0 server supports the playback operations used
+by ffmpeg/ffplay, VLC and go2rtc, with RTP either interleaved over TCP or over
+unicast UDP. This avoids requiring a separate gateway such as MediaMTX for a
+single camera while leaving the media API usable by one later.
+
 ## Configuration
 
 The application never searches for configuration beside installed source.
@@ -111,11 +117,49 @@ Useful diagnostics are explicit opt-ins:
 - `--play` sends HEVC video and 8 kHz mono signed 16-bit PCM audio to
   `ffplay`.
 - `--dump-media DIR` writes decrypted media and failed encrypted records.
+- `--rtsp-listen HOST:PORT` publishes the live stream at
+  `rtsp://HOST:PORT/stream`. For local-only access, use
+  `--rtsp-listen 127.0.0.1:8554`; to expose it on the LAN, bind the intended
+  interface address explicitly.
 - `--debug-unsafe` enables unredacted tracing.
 
 `--debug-unsafe` and `--dump-media` can disclose credentials, identifiers,
 session material, network details, audio, and video. Use private output
 locations and remove the results when no longer needed.
+
+## Media API and RTSP lifecycle
+
+The reusable boundary lives in `nexxt.media`. `MediaPipeline.feed_record()` is
+the only adapter from decrypted Nexxt records. It emits `VideoChunk` objects
+containing one complete HEVC Annex-B NAL and `AudioChunk` objects containing
+PCM s16le samples with 8000 Hz, mono and two-byte sample metadata. Synchronous
+`MediaSink` callbacks keep the existing receive loop simple; `MediaStream`
+turns those callbacks into a thread-safe broadcast whose subscriptions are
+async iterators.
+
+The RTSP API is independent of camera transport:
+
+```python
+from nexxt import MediaStream, RtspPublisher
+
+stream = MediaStream()
+publisher = RtspPublisher("127.0.0.1", 8554)
+url = await publisher.publish(stream)
+# Attach stream as a sink to the camera's MediaPipeline.
+...
+await publisher.stop()
+```
+
+The CLI starts the publisher first, then one Nexxt session, and keeps that
+session running whether zero, one, or several RTSP clients are connected.
+Client disconnects only release client RTP state. Shutdown closes the media
+pipeline, performs the existing graceful camera disconnect and stops RTSP.
+
+The publisher caches the latest VPS, SPS and PPS. A newly playing client is
+held until the next HEVC IRAP NAL, then receives the cached parameter sets and
+that random-access NAL before subsequent media. HEVC is never decoded or
+re-encoded. PCM byte order is changed losslessly from little endian to the
+network-order L16 RTP representation.
 
 ## Testing
 
@@ -132,6 +176,12 @@ deterministic, and requires no real camera or network. See
 
 - The network implementation is IPv4-oriented.
 - WAN/TURN/TCP fallback and a complete ICE engine are not implemented.
+- RTSP is an unauthenticated single-process publisher intended for trusted LAN
+  use. It does not implement recording, multicast or RTCP quality feedback.
+- Camera records currently expose NAL rather than full access-unit timing, so
+  video RTP timestamps use monotonic arrival time and assume the common camera
+  case where a VCL NAL ends a picture. This should be validated per additional
+  camera model before broad Home Assistant packaging.
 - Incoming STUN validation and multi-segment KCP datagram classification remain
   limited.
 - AUTH type semantics, complete response schemas, session reuse, and several

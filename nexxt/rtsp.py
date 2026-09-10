@@ -1,0 +1,458 @@
+"""Small asyncio RTSP 1.0 publisher for a :mod:`nexxt.media` stream.
+
+The server deliberately implements the publishing subset needed by ordinary
+RTSP players.  Media can use RTP over RTSP/TCP or unicast UDP; RTCP reception,
+recording, authentication and multicast are outside its scope.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import logging
+import random
+import re
+import socket
+import struct
+import threading
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .media import AudioChunk, MediaStream, MediaSubscription, VideoChunk
+
+LOG = logging.getLogger("nexxt_lan")
+MAX_CLIENT_WRITE_BUFFER = 2 * 1024 * 1024
+
+
+def _rtp_header(
+    payload_type: int, sequence: int, timestamp: int, ssrc: int, marker: bool
+) -> bytes:
+    return struct.pack(
+        ">BBHII",
+        0x80,
+        payload_type | (0x80 if marker else 0),
+        sequence,
+        timestamp,
+        ssrc,
+    )
+
+
+class _RtpTrack:
+    def __init__(self, payload_type: int, clock_rate: int) -> None:
+        self.payload_type = payload_type
+        self.clock_rate = clock_rate
+        self.sequence = random.randrange(65536)
+        self.ssrc = random.randrange(1, 2**32)
+        self.base_ns: Optional[int] = None
+        self.base_timestamp = random.randrange(2**32)
+        self.audio_timestamp = self.base_timestamp
+
+    def timestamp(self, timestamp_ns: int) -> int:
+        if self.base_ns is None:
+            self.base_ns = timestamp_ns
+        return (
+            self.base_timestamp
+            + (timestamp_ns - self.base_ns) * self.clock_rate // 1_000_000_000
+        ) & 0xFFFFFFFF
+
+    def packet(self, payload: bytes, timestamp: int, marker: bool = False) -> bytes:
+        result = (
+            _rtp_header(self.payload_type, self.sequence, timestamp, self.ssrc, marker)
+            + payload
+        )
+        self.sequence = (self.sequence + 1) & 0xFFFF
+        return result
+
+    def hevc(self, chunk: VideoChunk, mtu: int = 1200) -> list[bytes]:
+        nal = chunk.payload
+        if len(nal) < 2:
+            return []
+        timestamp = self.timestamp(chunk.timestamp_ns)
+        marker = chunk.nal_type < 32
+        if len(nal) <= mtu:
+            return [self.packet(nal, timestamp, marker)]
+        nal_type = (nal[0] >> 1) & 0x3F
+        indicator = bytes(((nal[0] & 0x81) | (49 << 1), nal[1]))
+        parts = [nal[pos : pos + mtu - 3] for pos in range(2, len(nal), mtu - 3)]
+        packets = []
+        for index, part in enumerate(parts):
+            fu_header = (
+                nal_type
+                | (0x80 if index == 0 else 0)
+                | (0x40 if index == len(parts) - 1 else 0)
+            )
+            packets.append(
+                self.packet(
+                    indicator + bytes((fu_header,)) + part,
+                    timestamp,
+                    marker and index == len(parts) - 1,
+                )
+            )
+        return packets
+
+    def pcm(self, chunk: AudioChunk, mtu: int = 1200) -> list[bytes]:
+        # RTP L16 is network-byte-order.  This is lossless repacketization of
+        # the camera's signed little-endian samples, not transcoding.
+        even_length = len(chunk.data) & ~1
+        little = chunk.data[:even_length]
+        network = bytearray(even_length)
+        network[0::2], network[1::2] = little[1::2], little[0::2]
+        result = []
+        for pos in range(0, len(network), mtu & ~1):
+            payload = bytes(network[pos : pos + (mtu & ~1)])
+            result.append(self.packet(payload, self.audio_timestamp))
+            self.audio_timestamp = (
+                self.audio_timestamp + len(payload) // 2
+            ) & 0xFFFFFFFF
+        return result
+
+
+@dataclass(eq=False)
+class _Client:
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    session_id: str = field(default_factory=lambda: f"{random.randrange(2**64):016x}")
+    playing: bool = False
+    waiting_for_irap: bool = True
+    transports: dict[int, tuple[str, object]] = field(default_factory=dict)
+    video: _RtpTrack = field(default_factory=lambda: _RtpTrack(96, 90000))
+    audio: _RtpTrack = field(default_factory=lambda: _RtpTrack(97, 8000))
+
+    def close_transports(self) -> None:
+        for kind, target in self.transports.values():
+            if kind == "udp":
+                sock, _address = target
+                sock.close()
+        self.transports.clear()
+
+
+class RtspPublisher:
+    """Publish one :class:`MediaStream` as an RTSP path.
+
+    The camera stream stays alive independently of RTSP clients.  Every new
+    client waits for the next IRAP NAL; cached VPS/SPS/PPS are injected just
+    before it so joining mid-session has a clean decoder entry point.
+    """
+
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = 8554, path: str = "/stream"
+    ) -> None:
+        self.host, self.port = host, port
+        self.path = "/" + path.strip("/")
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._task: Optional[asyncio.Task[None]] = None
+        self._clients: set[_Client] = set()
+        self._parameter_sets: dict[int, VideoChunk] = {}
+        self._stream: Optional[MediaStream] = None
+
+    @property
+    def url(self) -> str:
+        host = (
+            f"[{self.host}]"
+            if ":" in self.host and not self.host.startswith("[")
+            else self.host
+        )
+        return f"rtsp://{host}:{self.port}{self.path}"
+
+    async def start(self, stream: MediaStream) -> str:
+        if self._server is not None:
+            return self.url
+        self._stream = stream
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port
+        )
+        socket_name = self._server.sockets[0].getsockname()
+        if self.port == 0:
+            self.port = socket_name[1]
+        # Subscribe before returning so parameter sets arriving immediately
+        # after startup cannot fall into a task-scheduling gap.
+        subscription = stream.subscribe()
+        self._task = asyncio.create_task(
+            self._consume(subscription), name="nexxt-rtsp-media"
+        )
+        return self.url
+
+    async def publish(self, stream: MediaStream) -> str:
+        return await self.start(stream)
+
+    async def stop(self) -> None:
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        clients, self._clients = list(self._clients), set()
+        for client in clients:
+            client.close_transports()
+            client.writer.close()
+        for client in clients:
+            with contextlib.suppress(Exception):
+                await client.writer.wait_closed()
+
+    async def _consume(self, subscription: MediaSubscription) -> None:
+        try:
+            async for chunk in subscription:
+                if isinstance(chunk, VideoChunk):
+                    if chunk.is_parameter_set:
+                        self._parameter_sets[chunk.nal_type] = chunk
+                    self._broadcast_video(chunk)
+                else:
+                    self._broadcast_audio(chunk)
+        finally:
+            await subscription.close()
+
+    def _send(self, client: _Client, track: int, packet: bytes) -> None:
+        transport = client.transports.get(track)
+        if transport is None:
+            return
+        kind, target = transport
+        try:
+            if kind == "tcp":
+                transport_object = client.writer.transport
+                if (
+                    transport_object is not None
+                    and transport_object.get_write_buffer_size()
+                    > MAX_CLIENT_WRITE_BUFFER
+                ):
+                    LOG.warning("[warning] slow RTSP client disconnected")
+                    client.playing = False
+                    client.writer.close()
+                    return
+                channel = target
+                client.writer.write(
+                    b"$" + bytes((channel,)) + struct.pack(">H", len(packet)) + packet
+                )
+            else:
+                sock, address = target
+                sock.sendto(packet, address)
+        except (ConnectionError, OSError):
+            client.playing = False
+
+    def _broadcast_video(self, chunk: VideoChunk) -> None:
+        for client in tuple(self._clients):
+            if not client.playing or 0 not in client.transports:
+                continue
+            if client.waiting_for_irap:
+                if not chunk.is_irap:
+                    continue
+                for nal_type in (32, 33, 34):
+                    parameter = self._parameter_sets.get(nal_type)
+                    if parameter is not None:
+                        for packet in client.video.hevc(parameter):
+                            self._send(client, 0, packet)
+                client.waiting_for_irap = False
+            for packet in client.video.hevc(chunk):
+                self._send(client, 0, packet)
+
+    def _broadcast_audio(self, chunk: AudioChunk) -> None:
+        for client in tuple(self._clients):
+            if client.playing and 1 in client.transports:
+                for packet in client.audio.pcm(chunk):
+                    self._send(client, 1, packet)
+
+    def _sdp(self) -> bytes:
+        fmtp = ""
+        names = ((32, "sprop-vps"), (33, "sprop-sps"), (34, "sprop-pps"))
+        values = [
+            f"{name}={base64.b64encode(self._parameter_sets[k].payload).decode()}"
+            for k, name in names
+            if k in self._parameter_sets
+        ]
+        if values:
+            fmtp = "a=fmtp:96 " + ";".join(values) + "\r\n"
+        return (
+            "v=0\r\n"
+            "o=- 0 0 IN IP4 127.0.0.1\r\n"
+            "s=Nexxt camera\r\n"
+            "t=0 0\r\n"
+            "a=control:*\r\n"
+            "m=video 0 RTP/AVP 96\r\n"
+            "a=rtpmap:96 H265/90000\r\n"
+            f"{fmtp}"
+            "a=control:trackID=0\r\n"
+            "m=audio 0 RTP/AVP 97\r\n"
+            "a=rtpmap:97 L16/8000/1\r\n"
+            "a=control:trackID=1\r\n"
+        ).encode()
+
+    async def _response(
+        self,
+        client: _Client,
+        cseq: str,
+        status: str = "200 OK",
+        headers: Optional[dict[str, str]] = None,
+        body: bytes = b"",
+    ) -> None:
+        fields = {"CSeq": cseq, "Server": "nexxt-lan"}
+        fields.update(headers or {})
+        if body:
+            fields["Content-Length"] = str(len(body))
+        head = (
+            f"RTSP/1.0 {status}\r\n"
+            + "".join(f"{key}: {value}\r\n" for key, value in fields.items())
+            + "\r\n"
+        )
+        client.writer.write(head.encode() + body)
+        await client.writer.drain()
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        client = _Client(reader, writer)
+        self._clients.add(client)
+        peer = writer.get_extra_info("peername")
+        LOG.info("[rtsp] client connected: %s", peer)
+        try:
+            while True:
+                first = await reader.readexactly(1)
+                if first == b"$":
+                    interleaved = await reader.readexactly(3)
+                    await reader.readexactly(struct.unpack(">H", interleaved[1:3])[0])
+                    continue
+                request_line = first + await reader.readline()
+                if not request_line:
+                    break
+                parts = request_line.decode("latin1").strip().split()
+                if len(parts) != 3:
+                    break
+                method, uri, _version = parts
+                headers: dict[str, str] = {}
+                while True:
+                    line = await reader.readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+                    key, _, value = line.decode("latin1").partition(":")
+                    headers[key.lower()] = value.strip()
+                length = int(headers.get("content-length", "0"))
+                if length:
+                    await reader.readexactly(length)
+                cseq = headers.get("cseq", "0")
+                if method == "OPTIONS":
+                    await self._response(
+                        client,
+                        cseq,
+                        headers={
+                            "Public": "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
+                        },
+                    )
+                elif method == "DESCRIBE":
+                    await self._response(
+                        client,
+                        cseq,
+                        headers={
+                            "Content-Type": "application/sdp",
+                            "Content-Base": self.url + "/",
+                        },
+                        body=self._sdp(),
+                    )
+                elif method == "SETUP":
+                    track = 1 if uri.rstrip("/").endswith("trackID=1") else 0
+                    transport = headers.get("transport", "")
+                    tcp = re.search(r"interleaved=(\d+)(?:-(\d+))?", transport, re.I)
+                    udp = re.search(r"client_port=(\d+)(?:-(\d+))?", transport, re.I)
+                    if tcp:
+                        channel = int(tcp.group(1))
+                        client.transports[track] = ("tcp", channel)
+                        response_transport = f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1};ssrc={(client.video if track == 0 else client.audio).ssrc:08X}"
+                    elif udp:
+                        peer = writer.get_extra_info("peername")
+                        family = socket.AF_INET6 if ":" in peer[0] else socket.AF_INET
+                        rtp_socket = socket.socket(family, socket.SOCK_DGRAM)
+                        rtp_socket.bind((self.host, 0))
+                        server_port = rtp_socket.getsockname()[1]
+                        client.transports[track] = (
+                            "udp",
+                            (rtp_socket, (peer[0], int(udp.group(1)))),
+                        )
+                        response_transport = f"RTP/AVP;unicast;client_port={udp.group(1)}-{udp.group(2) or int(udp.group(1)) + 1};server_port={server_port}-{server_port + 1}"
+                    else:
+                        await self._response(client, cseq, "461 Unsupported Transport")
+                        continue
+                    await self._response(
+                        client,
+                        cseq,
+                        headers={
+                            "Session": client.session_id + ";timeout=60",
+                            "Transport": response_transport,
+                        },
+                    )
+                elif method == "PLAY":
+                    client.playing = True
+                    client.waiting_for_irap = True
+                    await self._response(
+                        client, cseq, headers={"Session": client.session_id}
+                    )
+                elif method == "GET_PARAMETER":
+                    await self._response(
+                        client, cseq, headers={"Session": client.session_id}
+                    )
+                elif method == "TEARDOWN":
+                    await self._response(
+                        client, cseq, headers={"Session": client.session_id}
+                    )
+                    break
+                else:
+                    await self._response(client, cseq, "405 Method Not Allowed")
+        except (asyncio.IncompleteReadError, ConnectionError, ValueError):
+            pass
+        finally:
+            self._clients.discard(client)
+            client.close_transports()
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            LOG.info("[rtsp] client disconnected: %s", peer)
+
+
+class RtspPublisherThread:
+    """Synchronous lifecycle adapter for the current blocking camera CLI."""
+
+    def __init__(self, publisher: RtspPublisher) -> None:
+        self.publisher = publisher
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready = threading.Event()
+        self._error: Optional[BaseException] = None
+
+    def start(self, stream: MediaStream) -> str:
+        def run() -> None:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self.publisher.start(stream))
+            except BaseException as exc:
+                self._error = exc
+                self._ready.set()
+                loop.close()
+                return
+            self._ready.set()
+            loop.run_forever()
+            loop.run_until_complete(self.publisher.stop())
+            loop.close()
+
+        self._thread = threading.Thread(target=run, name="nexxt-rtsp", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=5)
+        if self._error is not None:
+            raise RuntimeError(
+                f"could not start RTSP publisher: {self._error}"
+            ) from self._error
+        if not self._ready.is_set():
+            raise RuntimeError("timed out starting RTSP publisher")
+        return self.publisher.url
+
+    def stop(self) -> None:
+        loop, thread = self._loop, self._thread
+        if loop is None or thread is None or not thread.is_alive():
+            return
+        future = asyncio.run_coroutine_threadsafe(self.publisher.stop(), loop)
+        with contextlib.suppress(Exception):
+            future.result(timeout=3)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=3)

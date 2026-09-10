@@ -62,6 +62,17 @@ from nexxt.rtc_signaling import (
     make_candidate_message,
     session_number_from_id,
 )
+from nexxt.media import (
+    ANNEXB_START_CODE,
+    AudioChunk,
+    HevcAssembler,
+    MediaPipeline,
+    MediaSink,
+    MediaStream,
+    VideoChunk,
+    parse_media_record,
+)
+from nexxt.rtsp import RtspPublisher, RtspPublisherThread
 
 from tuya_p2p import (
     KCP,
@@ -1267,127 +1278,6 @@ MEDIA_KCP_CONFIG = KCPConfig(
     nc=1,
 )
 
-ANNEXB_START_CODE = b"\x00\x00\x00\x01"
-HEVC_FU_NAL_TYPE = 49
-MEDIA_SUBHEADER_SIZE = 12
-
-
-@dataclass(frozen=True)
-class MediaRecord:
-    extension: bytes
-    payload: bytes
-
-
-def parse_media_record(message: bytes) -> MediaRecord:
-    """Parse the variable-length Tuya media envelope exactly."""
-    if len(message) < 28:
-        raise ValueError(f"media record too short: {len(message)} bytes")
-
-    ext_len = struct.unpack_from("<Q", message, 16)[0]
-    if ext_len > len(message) - 28:
-        raise ValueError(
-            f"media extension exceeds record: ext_len={ext_len} len={len(message)}"
-        )
-
-    len_off = 24 + ext_len
-    payload_len = struct.unpack_from("<I", message, len_off)[0]
-    payload_off = len_off + 4
-    payload_end = payload_off + payload_len
-    if payload_end != len(message):
-        raise ValueError(
-            "media payload length mismatch: "
-            f"payload_off={payload_off} payload_len={payload_len} "
-            f"record_len={len(message)}"
-        )
-
-    return MediaRecord(
-        extension=message[24:len_off],
-        payload=message[payload_off:payload_end],
-    )
-
-
-class HevcAssembler:
-    """Reassemble Tuya's HEVC NAL and RFC-style type-49 FU payloads."""
-
-    def __init__(self) -> None:
-        self._fu_buffer: Optional[bytearray] = None
-        self._fu_type: Optional[int] = None
-        self.complete_nals = 0
-        self.reassembled_fu = 0
-        self.anomalies = 0
-
-    def _anomaly(self, message: str, *args) -> None:
-        self.anomalies += 1
-        LOG.debug("[debug] HEVC FU anomaly: " + message, *args)
-
-    def feed(self, data: bytes) -> list[bytes]:
-        if len(data) < 2:
-            self._anomaly("packet too short len=%d", len(data))
-            return []
-
-        nal_type = (data[0] >> 1) & 0x3F
-        if nal_type != HEVC_FU_NAL_TYPE:
-            if self._fu_buffer is not None:
-                self._anomaly(
-                    "complete NAL type=%d interrupted unfinished FU type=%d",
-                    nal_type,
-                    self._fu_type,
-                )
-                self._fu_buffer = None
-                self._fu_type = None
-            self.complete_nals += 1
-            return [ANNEXB_START_CODE + data]
-
-        if len(data) < 3:
-            self._anomaly("FU packet too short len=%d", len(data))
-            return []
-
-        fu_header = data[2]
-        start = bool(fu_header & 0x80)
-        end = bool(fu_header & 0x40)
-        fu_type = fu_header & 0x3F
-
-        if start:
-            if self._fu_buffer is not None:
-                self._anomaly(
-                    "new START type=%d replaced unfinished FU type=%d",
-                    fu_type,
-                    self._fu_type,
-                )
-            nal0 = (data[0] & 0x81) | (fu_type << 1)
-            self._fu_buffer = bytearray((nal0, data[1]))
-            self._fu_buffer.extend(data[3:])
-            self._fu_type = fu_type
-            if not end:
-                return []
-        else:
-            if self._fu_buffer is None:
-                self._anomaly(
-                    "%s without START type=%d",
-                    "END" if end else "CONT",
-                    fu_type,
-                )
-                return []
-            if fu_type != self._fu_type:
-                self._anomaly(
-                    "FU type changed expected=%d received=%d",
-                    self._fu_type,
-                    fu_type,
-                )
-                self._fu_buffer = None
-                self._fu_type = None
-                return []
-            self._fu_buffer.extend(data[3:])
-            if not end:
-                return []
-
-        assert self._fu_buffer is not None
-        complete = ANNEXB_START_CODE + bytes(self._fu_buffer)
-        self._fu_buffer = None
-        self._fu_type = None
-        self.reassembled_fu += 1
-        return [complete]
-
 
 class PlaybackPipe:
     """Lazy ffplay subprocess with a bounded, non-network writer thread.
@@ -1612,8 +1502,105 @@ class PlaybackPipe:
         thread.join(timeout=0.5)
 
 
+class DumpMediaSink:
+    def __init__(self, directory: Path) -> None:
+        self._video = (directory / "video.h265").open("wb")
+        self._audio = (directory / "audio.s16le").open("wb")
+
+    def start(self) -> None:
+        pass
+
+    def on_video(self, chunk: VideoChunk) -> None:
+        self._video.write(chunk.data)
+        self._video.flush()
+
+    def on_audio(self, chunk: AudioChunk) -> None:
+        self._audio.write(chunk.data)
+        self._audio.flush()
+
+    def close(self) -> None:
+        self._video.close()
+        self._audio.close()
+
+
+class PlaybackMediaSink:
+    def __init__(self, ffplay_path: str) -> None:
+        self.video_pipe = PlaybackPipe(
+            label="HEVC",
+            command=[
+                ffplay_path,
+                "-loglevel",
+                "warning",
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-framedrop",
+                "-f",
+                "hevc",
+                "-",
+            ],
+            max_bytes=16 * 1024 * 1024,
+            codec_safe=True,
+        )
+        self.audio_pipe = PlaybackPipe(
+            label="PCM audio",
+            command=[
+                ffplay_path,
+                "-loglevel",
+                "warning",
+                "-nodisp",
+                "-fflags",
+                "nobuffer",
+                "-f",
+                "s16le",
+                "-ar",
+                "8000",
+                "-ch_layout",
+                "mono",
+                "-",
+            ],
+            max_bytes=128 * 1024,
+        )
+
+    def start(self) -> None:
+        pass
+
+    def on_video(self, chunk: VideoChunk) -> None:
+        self.video_pipe.offer(chunk.data)
+
+    def on_audio(self, chunk: AudioChunk) -> None:
+        self.audio_pipe.offer(chunk.data)
+
+    def close(self) -> None:
+        self.video_pipe.close()
+        self.audio_pipe.close()
+
+
+class MediaLogSink:
+    def __init__(self) -> None:
+        self._video_started = False
+        self._audio_started = False
+
+    def start(self) -> None:
+        pass
+
+    def on_video(self, chunk: VideoChunk) -> None:
+        if not self._video_started:
+            LOG.info("[media] HEVC first NAL type=%d", chunk.nal_type)
+            self._video_started = True
+
+    def on_audio(self, chunk: AudioChunk) -> None:
+        if not self._audio_started:
+            LOG.info("[media] PCM audio started: s16le 8000 Hz mono")
+            self._audio_started = True
+
+    def close(self) -> None:
+        pass
+
+
 class MediaOutput:
-    """Parse decrypted records and route HEVC/PCM to dumps and playback."""
+    """Compatibility facade around the backend-neutral composable pipeline."""
 
     def __init__(
         self,
@@ -1621,125 +1608,46 @@ class MediaOutput:
         play: bool,
         ffplay_path: Optional[str],
         dump_dir: Optional[Path],
+        sinks: tuple[MediaSink, ...] | list[MediaSink] = (),
     ) -> None:
-        self.assembler = HevcAssembler()
-        self.video_chunks = 0
-        self.audio_chunks = 0
-        self.audio_bytes = 0
-        self.bad_records = Counter()
-        self._first_video = False
-        self._first_audio = False
-        self._video_dump = None
-        self._audio_dump = None
-        self.video_pipe: Optional[PlaybackPipe] = None
-        self.audio_pipe: Optional[PlaybackPipe] = None
-
+        configured_sinks = [MediaLogSink(), *sinks]
         if dump_dir is not None:
-            self._video_dump = (dump_dir / "video.h265").open("wb")
-            self._audio_dump = (dump_dir / "audio.s16le").open("wb")
-
+            configured_sinks.append(DumpMediaSink(dump_dir))
+        self._playback: Optional[PlaybackMediaSink] = None
         if play:
             if ffplay_path is None:
                 raise RuntimeError("--play requires ffplay in PATH")
-            try:
-                self.video_pipe = PlaybackPipe(
-                    label="HEVC",
-                    command=[
-                        ffplay_path,
-                        "-loglevel",
-                        "warning",
-                        "-fflags",
-                        "nobuffer",
-                        "-flags",
-                        "low_delay",
-                        "-framedrop",
-                        "-f",
-                        "hevc",
-                        "-",
-                    ],
-                    # Several seconds of variable-size HEVC access units.  A
-                    # byte bound prevents one large NAL from defeating it.
-                    max_bytes=16 * 1024 * 1024,
-                    codec_safe=True,
-                )
-                self.audio_pipe = PlaybackPipe(
-                    label="PCM audio",
-                    command=[
-                        ffplay_path,
-                        "-loglevel",
-                        "warning",
-                        "-nodisp",
-                        "-fflags",
-                        "nobuffer",
-                        "-f",
-                        "s16le",
-                        "-ar",
-                        "8000",
-                        "-ch_layout",
-                        "mono",
-                        "-",
-                    ],
-                    # 640-byte chunks are 40 ms, giving roughly eight seconds.
-                    max_bytes=128 * 1024,
-                )
-            except Exception:
-                if self.video_pipe is not None:
-                    self.video_pipe.close()
-                for handle in (self._video_dump, self._audio_dump):
-                    if handle is not None:
-                        handle.close()
-                raise
+            self._playback = PlaybackMediaSink(ffplay_path)
+            configured_sinks.append(self._playback)
+        self.pipeline = MediaPipeline(configured_sinks)
+        self.video_pipe = self._playback.video_pipe if self._playback else None
+        self.audio_pipe = self._playback.audio_pipe if self._playback else None
+
+    @property
+    def assembler(self) -> HevcAssembler:
+        return self.pipeline.assembler
+
+    @property
+    def video_chunks(self) -> int:
+        return self.pipeline.video_chunks
+
+    @property
+    def audio_chunks(self) -> int:
+        return self.pipeline.audio_chunks
+
+    @property
+    def audio_bytes(self) -> int:
+        return self.pipeline.audio_bytes
+
+    @property
+    def bad_records(self) -> Counter[int]:
+        return self.pipeline.bad_records
 
     def feed(self, conv: int, message_index: int, message: bytes) -> None:
-        try:
-            record = parse_media_record(message)
-            if len(record.payload) < MEDIA_SUBHEADER_SIZE:
-                raise ValueError(
-                    f"media payload too short for subheader: {len(record.payload)}"
-                )
-        except ValueError as exc:
-            self.bad_records[conv] += 1
-            LOG.debug(
-                "[debug] media envelope rejected conv=%d msg=%d: %s",
-                conv,
-                message_index,
-                exc,
-            )
-            return
-
-        data = record.payload[MEDIA_SUBHEADER_SIZE:]
-        if conv == 1:
-            for nal in self.assembler.feed(data):
-                self.video_chunks += 1
-                if not self._first_video:
-                    nal_type = (nal[4] >> 1) & 0x3F
-                    LOG.info("[media] HEVC first NAL type=%d", nal_type)
-                    self._first_video = True
-                if self._video_dump is not None:
-                    self._video_dump.write(nal)
-                    self._video_dump.flush()
-                if self.video_pipe is not None:
-                    self.video_pipe.offer(nal)
-        elif conv == 2:
-            self.audio_chunks += 1
-            self.audio_bytes += len(data)
-            if not self._first_audio:
-                LOG.info("[media] PCM audio started: s16le 8000 Hz mono")
-                self._first_audio = True
-            if self._audio_dump is not None:
-                self._audio_dump.write(data)
-                self._audio_dump.flush()
-            if self.audio_pipe is not None:
-                self.audio_pipe.offer(data)
+        self.pipeline.feed_record(conv, message_index, message)
 
     def close(self) -> None:
-        if self.video_pipe is not None:
-            self.video_pipe.close()
-        if self.audio_pipe is not None:
-            self.audio_pipe.close()
-        for handle in (self._video_dump, self._audio_dump):
-            if handle is not None:
-                handle.close()
+        self.pipeline.close()
 
     def summary(self) -> None:
         video_dropped = self.video_pipe.dropped if self.video_pipe is not None else 0
@@ -2049,6 +1957,7 @@ def run_udp_loop(
     dump_media: Optional[Path] = None,
     play: bool = False,
     ffplay_path: Optional[str] = None,
+    media_sinks: tuple[MediaSink, ...] | list[MediaSink] = (),
     on_prepared: Optional[Callable[[], None]] = None,
 ) -> None:
     LOG.info("[status] Waiting for ICE nomination " "(preview startup is not sent yet)")
@@ -2110,6 +2019,7 @@ def run_udp_loop(
         play=play,
         ffplay_path=ffplay_path,
         dump_dir=dump_media,
+        sinks=media_sinks,
     )
 
     media_receivers = {
@@ -2642,6 +2552,7 @@ def run_lan_preview(
     play: bool = False,
     rtc_mode: RTCMode = RTCMode.DIRECT,
     preconnect_activate_delay_ms: int = 0,
+    rtsp_listen: Optional[tuple[str, int]] = None,
 ) -> None:
     """Run the complete LAN signaling, ICE and encrypted preview workflow."""
     debug_enabled = debug or debug_unsafe
@@ -2656,71 +2567,86 @@ def run_lan_preview(
     ffplay_path = shutil.which("ffplay") if play else None
     if play and ffplay_path is None:
         raise RuntimeError("--play requires ffplay in PATH")
-    session = prepare_session(
-        client=client,
-        camera=camera,
-        debug=debug_enabled,
-        debug_unsafe=debug_unsafe,
-        rtc_mode=rtc_mode,
-    )
+    media_stream: Optional[MediaStream] = None
+    rtsp_thread: Optional[RtspPublisherThread] = None
+    if rtsp_listen is not None:
+        media_stream = MediaStream()
+        rtsp_thread = RtspPublisherThread(RtspPublisher(*rtsp_listen))
+        url = rtsp_thread.start(media_stream)
+        LOG.info("[status] RTSP stream available at %s", url)
 
-    # The offer advertises this endpoint as its only STUN server.  Keep the
-    # responder alive for the entire signaling/ICE exchange, so that the
-    # advertised LAN endpoint is real rather than merely descriptive JSON.
-    with ExitStack() as stack:
-        primary_udp = stack.enter_context(open_udp_candidate(client))
-        udp_sockets = [primary_udp, stack.enter_context(open_udp_candidate(client))]
-        stack.enter_context(
-            LocalStunServer(client.local_ip, client.stun_port, session.ice_password)
+    try:
+        session = prepare_session(
+            client=client,
+            camera=camera,
+            debug=debug_enabled,
+            debug_unsafe=debug_unsafe,
+            rtc_mode=rtc_mode,
         )
-        candidates = [
-            build_local_candidate(session, client, udp) for udp in udp_sockets
-        ]
 
-        with open_signaling_connection(camera) as sock:
-            signaling = SignalingState()
-            try:
-                exchange_signaling(
-                    sock,
-                    session,
-                    candidates,
-                    camera,
-                    state=signaling,
-                )
-                send_initial_ice_check(
-                    primary_udp,
-                    signaling,
-                    local_ufrag=session.local_ufrag,
-                )
-                LOG.debug(
-                    "[debug] Auth plaintext prepared bytes=%d hex=%s",
-                    len(session.auth_plaintext),
-                    session.auth_plaintext.hex(),
-                )
-                udp_kwargs: dict[str, Callable[[], None]] = {}
-                if session.rtc_mode is RTCMode.PRECONNECT:
-                    udp_kwargs["on_prepared"] = lambda: activate_preconnect_session(
+        # The offer advertises this endpoint as its only STUN server.  Keep the
+        # responder alive for the entire signaling/ICE exchange, so that the
+        # advertised LAN endpoint is real rather than merely descriptive JSON.
+        with ExitStack() as stack:
+            primary_udp = stack.enter_context(open_udp_candidate(client))
+            udp_sockets = [primary_udp, stack.enter_context(open_udp_candidate(client))]
+            stack.enter_context(
+                LocalStunServer(client.local_ip, client.stun_port, session.ice_password)
+            )
+            candidates = [
+                build_local_candidate(session, client, udp) for udp in udp_sockets
+            ]
+
+            with open_signaling_connection(camera) as sock:
+                signaling = SignalingState()
+                try:
+                    exchange_signaling(
                         sock,
                         session,
-                        signaling,
-                        activate_delay_ms=preconnect_activate_delay_ms,
+                        candidates,
+                        camera,
+                        state=signaling,
                     )
-                run_udp_loop(
-                    udp_sockets,
-                    ice_pwd=session.ice_password,
-                    auth_plaintext=session.auth_plaintext,
-                    aes_key=session.aes_key,
-                    dump_media=dump_media,
-                    play=play,
-                    ffplay_path=ffplay_path,
-                    **udp_kwargs,
-                )
-            except KeyboardInterrupt:
-                # Ctrl+C is an ordinary request to end an active LAN session.
-                # The finally block runs while this TCP socket is still open.
-                LOG.info("[status] Graceful shutdown requested")
-            finally:
-                graceful_disconnect(sock, session, signaling)
+                    send_initial_ice_check(
+                        primary_udp,
+                        signaling,
+                        local_ufrag=session.local_ufrag,
+                    )
+                    LOG.debug(
+                        "[debug] Auth plaintext prepared bytes=%d hex=%s",
+                        len(session.auth_plaintext),
+                        session.auth_plaintext.hex(),
+                    )
+                    udp_kwargs: dict[str, Callable[[], None]] = {}
+                    if session.rtc_mode is RTCMode.PRECONNECT:
+                        udp_kwargs["on_prepared"] = lambda: activate_preconnect_session(
+                            sock,
+                            session,
+                            signaling,
+                            activate_delay_ms=preconnect_activate_delay_ms,
+                        )
+                    run_udp_loop(
+                        udp_sockets,
+                        ice_pwd=session.ice_password,
+                        auth_plaintext=session.auth_plaintext,
+                        aes_key=session.aes_key,
+                        dump_media=dump_media,
+                        play=play,
+                        ffplay_path=ffplay_path,
+                        media_sinks=[media_stream] if media_stream is not None else [],
+                        **udp_kwargs,
+                    )
+                except KeyboardInterrupt:
+                    # Ctrl+C is an ordinary request to end an active LAN session.
+                    # The finally block runs while this TCP socket is still open.
+                    LOG.info("[status] Graceful shutdown requested")
+                finally:
+                    graceful_disconnect(sock, session, signaling)
+    finally:
+        if media_stream is not None:
+            media_stream.close()
+        if rtsp_thread is not None:
+            rtsp_thread.stop()
 
 
 def non_negative_integer(value: str) -> int:
@@ -2732,6 +2658,21 @@ def non_negative_integer(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
     return parsed
+
+
+def parse_rtsp_listen(value: str) -> tuple[str, int]:
+    """Parse HOST:PORT, including bracketed IPv6 literals."""
+    host, separator, port_text = value.rpartition(":")
+    if not separator or not host:
+        raise argparse.ArgumentTypeError("must be HOST:PORT")
+    host = host.strip("[]")
+    try:
+        port = int(port_text, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("RTSP port must be an integer") from exc
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("RTSP port must be between 0 and 65535")
+    return host, port
 
 
 def apply_kcp_backend(backend: KCPBackend) -> None:
@@ -2808,6 +2749,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="play live HEVC video and s16le 8 kHz mono audio with ffplay",
     )
+    parser.add_argument(
+        "--rtsp-listen",
+        type=parse_rtsp_listen,
+        metavar="HOST:PORT",
+        help="publish HEVC and PCM as RTSP (for example 127.0.0.1:8554)",
+    )
     args = parser.parse_args(argv)
     if args.play and shutil.which("ffplay") is None:
         parser.error("--play requires ffplay in PATH")
@@ -2830,6 +2777,7 @@ def main() -> None:
             play=args.play,
             rtc_mode=rtc_mode,
             preconnect_activate_delay_ms=args.preconnect_activate_delay_ms,
+            rtsp_listen=args.rtsp_listen,
         )
     except KeyboardInterrupt:
         # This also covers a repeated Ctrl+C while context managers are
