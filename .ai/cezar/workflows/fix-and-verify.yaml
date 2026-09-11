@@ -1,0 +1,130 @@
+name: fix-and-verify
+description: Implement locally, verify through the project contract, then publish to dev.
+steps:
+  - id: implement
+    name: Implement
+    runner: codex
+    prompt: "{{task}}"
+    skill: project-conventions
+
+  - id: sync
+    name: Sync with dev
+    command: |
+      set -eu
+      BRANCH="$(git branch --show-current)"
+      case "$BRANCH" in
+        cez/*) ;;
+        *) echo "Refusing to sync unexpected branch: $BRANCH" >&2; exit 1 ;;
+      esac
+      git add -A
+      if ! git diff --cached --quiet; then git commit -m "Cezar: ${BRANCH#cez/}"; fi
+      git fetch origin
+      if ! git merge-base --is-ancestor origin/dev HEAD; then git rebase origin/dev; fi
+
+  - id: verify
+    name: Verify
+    command: make test
+    onFail:
+      retry: implement
+      max: 2
+
+  - id: publish
+    name: Publish
+    command: |
+      set -eu
+      BRANCH="$(git branch --show-current)"
+      case "$BRANCH" in
+        cez/*) ;;
+        *) echo "Refusing to publish unexpected branch: $BRANCH" >&2; exit 1 ;;
+      esac
+      git fetch origin
+      if ! git merge-base --is-ancestor origin/dev HEAD; then
+        echo "Task branch is no longer based on current origin/dev; refusing to publish unverified rebased code." >&2
+        exit 1
+      fi
+      git add -A
+      if ! git diff --cached --quiet; then git commit -m "Cezar: ${BRANCH#cez/}"; fi
+      if git diff --quiet origin/dev...HEAD; then
+        echo "done/no changes"
+      else
+        git push -u origin "$BRANCH"
+        PR_NUMBER="$(gh pr list --head "$BRANCH" --base dev --state open --json number --jq '.[0].number // empty')"
+        if [ -z "$PR_NUMBER" ]; then
+          PR_URL="$(gh pr create --base dev --head "$BRANCH" --fill)"
+          PR_NUMBER="${PR_URL##*/}"
+        fi
+        gh pr merge "$PR_NUMBER" --auto --squash
+        echo "PR #$PR_NUMBER published with squash auto-merge enabled."
+      fi
+
+  - id: merge
+    name: Merge to dev
+    command: |
+      set -eu
+      BRANCH="$(git branch --show-current)"
+      case "$BRANCH" in
+        cez/*) ;;
+        *) echo "Refusing to await merge for unexpected branch: $BRANCH" >&2; exit 1 ;;
+      esac
+      git fetch origin
+      if git diff --quiet origin/dev...HEAD; then
+        echo "done/no changes"
+        exit 0
+      fi
+      PRS="$(gh pr list --head "$BRANCH" --base dev --state open --limit 2 --json number --jq '.[].number')"
+      if [ "$(printf '%s\n' "$PRS" | sed '/^$/d' | wc -l)" -ne 1 ]; then
+        echo "Merge to dev failed: expected exactly one pull request for $BRANCH into dev." >&2
+        exit 1
+      fi
+      PR_NUMBER="$(printf '%s\n' "$PRS" | sed '/^$/d')"
+      EXPECTED_HEAD="$(git rev-parse HEAD)"
+      PR_IDENTITY="$(gh pr view "$PR_NUMBER" --json state,baseRefName,headRefName,headRefOid --jq '[.state,.baseRefName,.headRefName,.headRefOid] | join("|")')"
+      if [ "$PR_IDENTITY" != "OPEN|dev|$BRANCH|$EXPECTED_HEAD" ]; then
+        echo "Merge to dev failed: pull request identity or head revision is not the expected open $BRANCH into dev." >&2
+        exit 1
+      fi
+      CHECK_DEADLINE=$(( $(date +%s) + 1800 ))
+      LAST_CHECK_ERROR=""
+      while :; do
+        set +e
+        REQUIRED="$(gh pr checks "$PR_NUMBER" --required 2>&1)"
+        CHECK_STATUS=$?
+        set -e
+        if [ -n "$REQUIRED" ]; then
+          FAILED="$(printf '%s\n' "$REQUIRED" | awk -F '\t' '$2 == "fail" || $2 == "cancel" { print; exit }')"
+          if [ -n "$FAILED" ]; then
+            printf 'Merge to dev failed: required check (name, bucket, duration, link): %s\n' "$(printf '%s' "$FAILED" | cut -c1-2000)" >&2
+            exit 1
+          fi
+          if [ "$CHECK_STATUS" -eq 0 ]; then break; fi
+          if [ "$CHECK_STATUS" -eq 8 ]; then
+            LAST_CHECK_ERROR="$(printf '%s' "$REQUIRED" | tr '\n' ' ' | cut -c1-2000)"
+          else
+            LAST_CHECK_ERROR="GitHub required-check query was not readable (exit $CHECK_STATUS)."
+          fi
+        else
+          LAST_CHECK_ERROR="GitHub did not report any required checks."
+        fi
+        if [ "$(date +%s)" -ge "$CHECK_DEADLINE" ]; then
+          echo "Merge to dev failed: required checks were missing, pending, or unreadable for 1800 seconds. ${LAST_CHECK_ERROR}" >&2
+          exit 1
+        fi
+        sleep 10
+      done
+      DEADLINE=$(( $(date +%s) + 300 ))
+      while :; do
+        PR_STATE="$(gh pr view "$PR_NUMBER" --json state,mergedAt,baseRefName,headRefName,headRefOid --jq '[.state,(.mergedAt // ""),.baseRefName,.headRefName,.headRefOid] | join("|")')" || {
+          echo "Merge to dev failed: pull request state could not be read safely." >&2
+          exit 1
+        }
+        case "$PR_STATE" in
+          "MERGED|"?*"|dev|$BRANCH|$EXPECTED_HEAD")
+            echo "PR #$PR_NUMBER merged into dev after required checks passed."
+            exit 0 ;;
+        esac
+        if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+          echo "Merge to dev failed: required checks passed but the expected pull request did not merge into dev within 300 seconds." >&2
+          exit 1
+        fi
+        sleep 10
+      done

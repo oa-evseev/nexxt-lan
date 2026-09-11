@@ -1,0 +1,44 @@
+# RGN managed protocol v5. Fresh-checkout setup still belongs in `make test`.
+.PHONY: rgn-sync-dev rgn-review rgn-release
+
+rgn-sync-dev:
+	@branch=$$(git branch --show-current); \
+	if [ "$$branch" != dev ]; then echo "Error: this command requires dev (current: $${branch:-detached HEAD})." >&2; exit 1; fi; \
+	if [ -n "$$(git status --porcelain)" ]; then echo 'Error: the working tree must be clean.' >&2; exit 1; fi; \
+	git fetch origin && git merge --ff-only origin/dev || exit 1; \
+	git submodule sync -- || exit 1; \
+	bash -eu -o pipefail -c '\
+	while IFS= read -r key && IFS= read -r -d "" path; do\
+		expected=$$(git rev-parse --verify "HEAD:$$path" 2>/dev/null || printf unavailable);\
+		actual=unavailable;\
+		if [ -e "$$path/.git" ]; then actual=$$(git -C "$$path" rev-parse --verify HEAD 2>/dev/null || printf unavailable); fi;\
+		if [ "$$actual" != "$$expected" ]; then\
+			git submodule update --init --checkout --depth 1 -- "$$path" >/dev/null 2>&1 || :;\
+			actual=unavailable;\
+			if [ -e "$$path/.git" ]; then actual=$$(git -C "$$path" rev-parse --verify HEAD 2>/dev/null || printf unavailable); fi;\
+		fi;\
+		if [ "$$actual" != "$$expected" ]; then\
+			printf "Error: submodule %q expected %s, actual %s; run: git submodule update --init --checkout --depth 1 -- %q\n" "$$path" "$$expected" "$$actual" "$$path" >&2; exit 1;\
+		fi;\
+	done < <(git config --file .gitmodules --null --get-regexp "^submodule\\..*\\.path$$" 2>/dev/null || :);\
+	'
+
+rgn-review: rgn-sync-dev
+	@$(MAKE) --no-print-directory test
+
+# HUMAN ONLY. Automation and Cezar must never invoke this target.
+rgn-release:
+	@branch=$$(git branch --show-current); \
+	if [ "$$branch" != dev ]; then echo "Error: make release requires dev (current: $${branch:-detached HEAD})." >&2; exit 1; fi; \
+	if [ -n "$$(git status --porcelain)" ]; then echo 'Error: the working tree must be clean.' >&2; exit 1; fi; \
+	command -v gh >/dev/null 2>&1 || { echo 'Error: GitHub CLI (gh) is required.' >&2; exit 1; }; \
+	git fetch origin || exit 1; \
+	test "$$(git rev-parse HEAD)" = "$$(git rev-parse refs/heads/dev)" || { echo 'Error: HEAD must be the local dev branch.' >&2; exit 1; }; \
+	test "$$(git rev-parse refs/heads/dev)" = "$$(git rev-parse refs/remotes/origin/dev)" || { echo 'Error: local dev must exactly match origin/dev. Run make review.' >&2; exit 1; }; \
+	if git merge-base --is-ancestor origin/dev origin/main; then echo 'Release already complete: main contains dev.'; exit 0; fi; \
+	$(MAKE) --no-print-directory test || exit 1; \
+	url=$$(gh pr list --state open --base main --head dev --json url --jq '.[0].url // empty') || exit 1; \
+	if [ -z "$$url" ]; then url=$$(gh pr create --base main --head dev --title 'Release dev to main' --body 'Human-reviewed release from dev. Merge only after required checks pass.') || exit 1; fi; \
+	auto=$$(gh pr view "$$url" --json autoMergeRequest --jq '.autoMergeRequest != null') || exit 1; \
+	if [ "$$auto" = true ]; then echo "Release PR already awaits required checks: $$url"; \
+	else gh pr merge "$$url" --auto --merge || exit 1; echo "Release PR awaits required checks: $$url"; fi
