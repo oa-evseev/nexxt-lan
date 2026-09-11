@@ -99,7 +99,9 @@ def test_process_default_backend_is_explicit_and_per_instance_wins():
         assert get_default_backend() == "python"
         assert type(KCP(1, lambda _: None)).__name__ == "PythonKCP"
         if native_available():
-            assert type(KCP(1, lambda _: None, backend="native")).__name__ == "NativeKCP"
+            assert (
+                type(KCP(1, lambda _: None, backend="native")).__name__ == "NativeKCP"
+            )
     assert get_default_backend() == "auto"
 
     previous = set_default_backend("python")

@@ -27,14 +27,27 @@ class ServeCamera:
     stream: MediaStream
 
 
-def build_serve_cameras(
+@dataclass(frozen=True, slots=True)
+class ServeProfile:
+    """Validated persistent profile and normalized RTSP publication path."""
+
+    profile: DeviceConfig
+    path: str
+
+
+def validate_serve_config(
     config: ConfigFile,
-    selectors: tuple[str, ...] | list[str],
-    resolve_camera: Callable[[DeviceConfig], CameraConfig],
-) -> tuple[ServeCamera, ...]:
-    """Resolve selected profiles and validate their independent paths."""
-    result: list[ServeCamera] = []
-    seen: set[str] = set()
+    selectors: tuple[str, ...] | list[str] = (),
+) -> tuple[ServeProfile, ...]:
+    """Validate profiles needed by the multi-camera RTSP service.
+
+    This intentionally does not resolve environment-backed credentials or
+    network state, so embedding applications can validate a config file before
+    starting any camera session.
+    """
+    result: list[ServeProfile] = []
+    seen_paths: set[str] = set()
+    seen_devices: set[str] = set()
     for profile in select_serve_cameras(config, selectors):
         assert profile.rtsp_path is not None
         try:
@@ -43,9 +56,25 @@ def build_serve_cameras(
             raise RuntimeError(
                 f"camera {profile.name!r} has invalid rtsp_path: {exc}"
             ) from exc
-        if path in seen:
+        if path in seen_paths:
             raise RuntimeError(f"duplicate RTSP publication path {path}")
-        seen.add(path)
+        if profile.id in seen_devices:
+            raise RuntimeError(f"duplicate camera device id {profile.id!r}")
+        seen_paths.add(path)
+        seen_devices.add(profile.id)
+        result.append(ServeProfile(profile, path))
+    return tuple(result)
+
+
+def build_serve_cameras(
+    config: ConfigFile,
+    selectors: tuple[str, ...] | list[str],
+    resolve_camera: Callable[[DeviceConfig], CameraConfig],
+) -> tuple[ServeCamera, ...]:
+    """Resolve selected profiles and validate their independent paths."""
+    result: list[ServeCamera] = []
+    for validated in validate_serve_config(config, selectors):
+        profile, path = validated.profile, validated.path
         result.append(
             ServeCamera(
                 profile.name, profile, resolve_camera(profile), path, MediaStream()

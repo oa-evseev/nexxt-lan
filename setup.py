@@ -20,7 +20,7 @@ setup(
         "discovery": ["tinytuya>=1.20"],
         "native": [f"nexxt-lan-native=={VERSION}"],
         "test": ["pytest>=8"],
-        "dev": ["pytest>=8", "black>=24"],
+        "dev": ["pytest>=8", "black>=24", "build>=1.2", "twine>=5"],
     },
     py_modules=["nexxt_lan"],
     packages=find_packages(include=["nexxt*", "tuya_p2p*"]),

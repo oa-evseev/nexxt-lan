@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Nexxt LAN",
+        "description": "Choose an existing nexxt-lan version 1 config file.",
+        "data": {
+          "config_path": "Config file path"
+        }
+      }
+    },
+    "error": {
+      "invalid_config": "The config file is missing, invalid, or has no valid RTSP-enabled cameras."
+    },
+    "abort": {
+      "already_configured": "This config file is already configured."
+    }
+  }
+}

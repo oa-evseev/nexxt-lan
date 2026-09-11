@@ -36,7 +36,7 @@ setup(
     long_description=(PACKAGE_DIR / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     license="MIT",
-    license_files=["vendor/kcp/LICENSE"],
+    license_files=["LICENSE", "vendor/kcp/LICENSE"],
     python_requires=">=3.10",
     install_requires=["cffi>=1.15"],
     cffi_modules=["_kcp_build.py:ffibuilder"],

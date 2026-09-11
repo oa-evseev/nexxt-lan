@@ -79,17 +79,20 @@ class _Segment:
     xmit: int = 0
 
     def encode(self) -> bytes:
-        return struct.pack(
-            "<IBBHIIII",
-            self.conv & UINT32_MASK,
-            self.cmd & 0xFF,
-            self.frg & 0xFF,
-            self.wnd & 0xFFFF,
-            self.ts & UINT32_MASK,
-            self.sn & UINT32_MASK,
-            self.una & UINT32_MASK,
-            len(self.data),
-        ) + self.data
+        return (
+            struct.pack(
+                "<IBBHIIII",
+                self.conv & UINT32_MASK,
+                self.cmd & 0xFF,
+                self.frg & 0xFF,
+                self.wnd & 0xFFFF,
+                self.ts & UINT32_MASK,
+                self.sn & UINT32_MASK,
+                self.una & UINT32_MASK,
+                len(self.data),
+            )
+            + self.data
+        )
 
 
 class PythonKCP:
@@ -209,7 +212,11 @@ class PythonKCP:
         del self.rcv_queue[:count]
 
         moved = []
-        while self.rcv_buf and _itimediff(self.rcv_buf[0].sn, self.rcv_nxt) == 0 and len(self.rcv_queue) < self.rcv_wnd:
+        while (
+            self.rcv_buf
+            and _itimediff(self.rcv_buf[0].sn, self.rcv_nxt) == 0
+            and len(self.rcv_queue) < self.rcv_wnd
+        ):
             seg = self.rcv_buf.pop(0)
             self.rcv_queue.append(seg)
             self.rcv_nxt = _u32(self.rcv_nxt + 1)
@@ -243,13 +250,15 @@ class PythonKCP:
         flag = False
 
         while len(packet) - offset >= IKCP_OVERHEAD:
-            conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from("<IBBHIIII", packet, offset)
+            conv, cmd, frg, wnd, ts, sn, una, length = struct.unpack_from(
+                "<IBBHIIII", packet, offset
+            )
             offset += IKCP_OVERHEAD
             if conv != self.conv:
                 return -1
             if len(packet) - offset < length:
                 return -2
-            payload = packet[offset:offset + length]
+            payload = packet[offset : offset + length]
             offset += length
 
             if cmd not in (IKCP_CMD_PUSH, IKCP_CMD_ACK, IKCP_CMD_WASK, IKCP_CMD_WINS):
@@ -276,10 +285,18 @@ class PythonKCP:
                 if _itimediff(sn, _u32(self.rcv_nxt + self.rcv_wnd)) < 0:
                     self.acklist.append((sn, ts))
                     if _itimediff(sn, self.rcv_nxt) >= 0:
-                        self._parse_data(_Segment(
-                            conv=conv, cmd=cmd, frg=frg, wnd=wnd, ts=ts,
-                            sn=sn, una=una, data=payload
-                        ))
+                        self._parse_data(
+                            _Segment(
+                                conv=conv,
+                                cmd=cmd,
+                                frg=frg,
+                                wnd=wnd,
+                                ts=ts,
+                                sn=sn,
+                                una=una,
+                                data=payload,
+                            )
+                        )
 
             elif cmd == IKCP_CMD_WASK:
                 self.probe |= IKCP_ASK_TELL
@@ -401,7 +418,10 @@ class PythonKCP:
 
     def _parse_data(self, newseg: _Segment) -> None:
         sn = newseg.sn
-        if _itimediff(sn, _u32(self.rcv_nxt + self.rcv_wnd)) >= 0 or _itimediff(sn, self.rcv_nxt) < 0:
+        if (
+            _itimediff(sn, _u32(self.rcv_nxt + self.rcv_wnd)) >= 0
+            or _itimediff(sn, self.rcv_nxt) < 0
+        ):
             return
 
         repeat = False
@@ -419,7 +439,11 @@ class PythonKCP:
         if not repeat:
             self.rcv_buf.insert(insert_idx, newseg)
 
-        while self.rcv_buf and _itimediff(self.rcv_buf[0].sn, self.rcv_nxt) == 0 and len(self.rcv_queue) < self.rcv_wnd:
+        while (
+            self.rcv_buf
+            and _itimediff(self.rcv_buf[0].sn, self.rcv_nxt) == 0
+            and len(self.rcv_queue) < self.rcv_wnd
+        ):
             seg = self.rcv_buf.pop(0)
             self.rcv_queue.append(seg)
             self.rcv_nxt = _u32(self.rcv_nxt + 1)
@@ -439,10 +463,16 @@ class PythonKCP:
             buf.extend(encoded)
 
         for sn, ts in self.acklist:
-            emit(_Segment(
-                conv=self.conv, cmd=IKCP_CMD_ACK, wnd=wnd,
-                ts=ts, sn=sn, una=self.rcv_nxt
-            ))
+            emit(
+                _Segment(
+                    conv=self.conv,
+                    cmd=IKCP_CMD_ACK,
+                    wnd=wnd,
+                    ts=ts,
+                    sn=sn,
+                    una=self.rcv_nxt,
+                )
+            )
         self.acklist.clear()
 
         if self.rmt_wnd == 0:
@@ -469,7 +499,9 @@ class PythonKCP:
         if not self.nocwnd:
             cwnd = min(self.cwnd, cwnd)
 
-        while _itimediff(self.snd_nxt, _u32(self.snd_una + cwnd)) < 0 and self.snd_queue:
+        while (
+            _itimediff(self.snd_nxt, _u32(self.snd_una + cwnd)) < 0 and self.snd_queue
+        ):
             newseg = self.snd_queue.pop(0)
             newseg.conv = self.conv
             newseg.cmd = IKCP_CMD_PUSH

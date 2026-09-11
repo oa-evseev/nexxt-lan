@@ -7,6 +7,7 @@ from .media import (
     MediaStream,
     VideoChunk,
 )
+from .manager import ManagedCamera, NexxtLanManager, validate_config_file
 from .rtsp import RtspPublisher, RtspServer
 
 __all__ = [
@@ -14,7 +15,10 @@ __all__ = [
     "MediaPipeline",
     "MediaSink",
     "MediaStream",
+    "ManagedCamera",
+    "NexxtLanManager",
     "RtspPublisher",
     "RtspServer",
     "VideoChunk",
+    "validate_config_file",
 ]

@@ -62,7 +62,7 @@ def native_available() -> bool:
 
 def available_backends() -> tuple[Literal["python", "native"], ...]:
     """Return installed concrete backends, in preference order."""
-    return (("native", "python") if native_available() else ("python",))
+    return ("native", "python") if native_available() else ("python",)
 
 
 def _implementation(backend: KCPBackend):

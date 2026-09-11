@@ -33,9 +33,25 @@ When building both unpublished distributions from a checkout, build the
 native wheel first and offer it to pip as a local artifact:
 
 ```sh
-python -m pip wheel --wheel-dir dist ./native
-python -m pip install --find-links dist '.[native]'
+make build-native
+python -m pip install --find-links dist/nexxt-lan-native '.[native]'
 ```
+
+## Release preparation
+
+Install the development extra once, then run the full local release gate:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev,discovery]'
+make release-check
+```
+
+The command runs tests, import and formatting checks, builds both
+distributions, and validates their metadata. It never uploads to PyPI.
+Artefacts are kept separate in `dist/nexxt-lan/` and
+`dist/nexxt-lan-native/`; use `make clean` before an ad-hoc rebuild if needed.
 
 Install optional TinyTuya discovery support with:
 
@@ -101,6 +117,23 @@ published by `serve`, even if they are enabled. Paths are one URL-safe segment.
 
 TinyTuya discovery is optional and imported only when its resolver is used.
 The configured environment resolver remains the default CLI behavior.
+
+## Home Assistant custom integration
+
+The camera-only custom integration lives in `custom_components/nexxt_lan`.
+Install this repository's `nexxt-lan` Python package in the Home Assistant
+environment, copy that directory to `/config/custom_components/nexxt_lan`, and
+restart Home Assistant. Then choose **Settings > Devices & services > Add
+integration > Nexxt LAN** and enter the absolute path, as seen by Home
+Assistant, to the existing version 1 config file.
+
+The config flow validates the file and its RTSP-enabled profiles without
+opening camera connections. Entry setup resolves the environment-backed
+runtime values, starts one in-process `NexxtLanManager`, and creates one camera
+entity per RTSP-enabled profile. The manager shares one local RTSP listener
+across those entities; no `nexxt-lan serve` subprocess is launched. The
+environment variables referenced by the config must therefore be available to
+the Home Assistant process.
 
 ## Supported operation
 
