@@ -20,3 +20,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+# Cezar runtime state (generated locally; project assets remain versioned)
+.ai/cezar/.gitignore
+.ai/cezar/helper-queue.json
+.ai/cezar/runs.json
+.ai/cezar/runs/
+.ai/cezar/worktrees/
+.ai/cezar/maintenance-audit.ndjson

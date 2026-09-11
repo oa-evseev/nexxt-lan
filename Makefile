@@ -72,3 +72,9 @@ clean:
 
 distclean: clean
 	rm -rf .venv
+# BEGIN RGN MANAGED MAKE CONTRACT (v5)
+include Makefile.rgn
+.PHONY: review release
+review: rgn-review
+release: rgn-release
+# END RGN MANAGED MAKE CONTRACT (v5)
